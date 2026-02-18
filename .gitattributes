@@ -1,0 +1,11 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Go specific
+*.go text diff=golang
+
+# Binary files
+*.pem binary
+*.key binary
+*.crt binary
+*.cert binary

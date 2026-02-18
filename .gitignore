@@ -1,0 +1,143 @@
+# Binaries
+micropki-cli
+micropki-cli.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+*.cov
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.*.swp
+.*.swo
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific - сгенерированные файлы (НЕ добавляем в git)
+pki/
+*.pem
+*.key
+*.crt
+*.cert
+*.csr
+*.srlcat > .gitignore << 'EOF'
+# Binaries
+micropki-cli
+micropki-cli.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+*.cov
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.*.swp
+.*.swo
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific - сгенерированные файлы (НЕ добавляем в git)
+pki/
+*.pem
+*.key
+*.crt
+*.cert
+*.csr
+*.srl
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+pass.txt
+pass*.txt
+secrets/
+*.pass
+*.password
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Coverage files
+coverage.html
+coverage.out
+EOF
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+pass.txt
+pass*.txt
+secrets/
+*.pass
+*.password
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Coverage files
+coverage.html
+coverage.out
