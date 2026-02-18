@@ -48,7 +48,7 @@ MicroPKI — это профессиональный инструмент ком
 
 ```bash
 # 1. Клонируйте репозиторий
-git clone https://github.com/yourusername/micropki.git
+git clone https://github.com/feronski-bkpk/micropki
 cd micropki
 
 # 2. Соберите проект
