@@ -1,5 +1,18 @@
-// Package chain implements certificate chain validation and management
-// according to RFC 5280.
+// Package chain реализует проверку цепочек сертификатов и управление ими
+// в соответствии с RFC 5280 (Internet X.509 Public Key Infrastructure).
+//
+// Пакет предоставляет функциональность для:
+//   - Загрузки цепочек сертификатов из PEM-файлов
+//   - Проверки целостности цепочек (подписи, сроки действия, ограничения)
+//   - Валидации расширений (Basic Constraints, Key Usage)
+//   - Проверки совместимости с OpenSSL
+//
+// Цепочка сертификатов состоит из трёх уровней:
+//   - Корневой CA (самоподписанный)
+//   - Промежуточный CA (подписан корневым)
+//   - Конечный сертификат (подписан промежуточным)
+//
+// Пакет реализует требования TEST-7.
 package chain
 
 import (
@@ -10,28 +23,48 @@ import (
 	"time"
 )
 
-// Chain represents a complete certificate chain
+// Chain представляет полную цепочку сертификатов от корневого до конечного.
+// Структура гарантирует, что все три сертификата загружены и могут быть
+// проверены как единая цепочка доверия.
 type Chain struct {
-	Leaf         *x509.Certificate
+	// Leaf - конечный сертификат (end-entity certificate)
+	// Не может быть CA, может содержать DNS имена, IP адреса, email'ы
+	Leaf *x509.Certificate
+
+	// Intermediate - промежуточный центр сертификации
+	// Должен быть CA и иметь правильные KeyUsage
 	Intermediate *x509.Certificate
-	Root         *x509.Certificate
+
+	// Root - корневой центр сертификации (самоподписанный)
+	// Должен быть CA, издатель должен совпадать с субъектом
+	Root *x509.Certificate
 }
 
-// LoadChain loads certificates from files and builds a chain
+// LoadChain загружает сертификаты из файлов и строит цепочку.
+// Все файлы должны быть в PEM-формате с блоками типа "CERTIFICATE".
+//
+// Параметры:
+//   - leafPath: путь к файлу с конечным сертификатом
+//   - intermediatePath: путь к файлу с промежуточным сертификатом
+//   - rootPath: путь к файлу с корневым сертификатом
+//
+// Возвращает:
+//   - *Chain: структуру цепочки для дальнейшей проверки
+//   - error: ошибку, если любой из файлов не может быть загружен или распарсен
 func LoadChain(leafPath, intermediatePath, rootPath string) (*Chain, error) {
 	leaf, err := LoadCertificate(leafPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load leaf certificate: %w", err)
+		return nil, fmt.Errorf("не удалось загрузить конечный сертификат: %w", err)
 	}
 
 	intermediate, err := LoadCertificate(intermediatePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load intermediate certificate: %w", err)
+		return nil, fmt.Errorf("не удалось загрузить промежуточный сертификат: %w", err)
 	}
 
 	root, err := LoadCertificate(rootPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load root certificate: %w", err)
+		return nil, fmt.Errorf("не удалось загрузить корневой сертификат: %w", err)
 	}
 
 	return &Chain{
@@ -41,84 +74,102 @@ func LoadChain(leafPath, intermediatePath, rootPath string) (*Chain, error) {
 	}, nil
 }
 
-// LoadCertificate loads and parses a PEM-encoded certificate
+// LoadCertificate загружает и парсит PEM-сертификат из файла.
+// Функция ожидает файл в формате PEM с одним блоком типа "CERTIFICATE".
+//
+// Возвращает ошибку, если:
+//   - Файл не может быть прочитан
+//   - PEM-декодирование не удалось
+//   - Тип блока не CERTIFICATE
+//   - Парсинг сертификата не удался
 func LoadCertificate(path string) (*x509.Certificate, error) {
 	pemData, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read certificate file: %w", err)
+		return nil, fmt.Errorf("не удалось прочитать файл сертификата: %w", err)
 	}
 
 	block, _ := pem.Decode(pemData)
 	if block == nil {
-		return nil, fmt.Errorf("failed to decode PEM certificate")
+		return nil, fmt.Errorf("не удалось декодировать PEM сертификат")
 	}
 	if block.Type != "CERTIFICATE" {
-		return nil, fmt.Errorf("invalid PEM type: %s (expected CERTIFICATE)", block.Type)
+		return nil, fmt.Errorf("неверный тип PEM: %s (ожидался CERTIFICATE)", block.Type)
 	}
 
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+		return nil, fmt.Errorf("не удалось разобрать сертификат: %w", err)
 	}
 
 	return cert, nil
 }
 
-// Verify verifies the complete certificate chain
-// Implements TEST-7 requirements:
-// - Signatures at each level
-// - Validity periods
-// - Basic Constraints (CA flag and path length)
-// - Key Usage / Extended Key Usage compatibility
+// Verify проверяет полную цепочку сертификатов.
+// Реализует требования TEST-7:
+//   - Проверка подписей на каждом уровне
+//   - Проверка сроков действия
+//   - Проверка Basic Constraints (флаг CA и ограничения длины пути)
+//   - Проверка совместимости Key Usage / Extended Key Usage
+//
+// Последовательность проверок:
+//  1. Конечный сертификат не должен быть CA
+//  2. Промежуточный и корневой должны быть CA
+//  3. Все сертификаты должны быть действительны в текущий момент
+//  4. Подпись конечного сертификата проверяется промежуточным CA
+//  5. Подпись промежуточного CA проверяется корневым CA
+//  6. Проверка KeyUsage для CA сертификатов
+//  7. Проверка ограничений длины пути
+//
+// Возвращает ошибку, если любая из проверок не пройдена.
 func (c *Chain) Verify() error {
-	// 1. Verify leaf certificate is not a CA
+	// 1. Проверка, что конечный сертификат не является CA
 	if c.Leaf.IsCA {
-		return fmt.Errorf("leaf certificate cannot be a CA")
+		return fmt.Errorf("конечный сертификат не может быть CA")
 	}
 
-	// 2. Verify intermediate is a CA
+	// 2. Проверка, что промежуточный сертификат является CA
 	if !c.Intermediate.IsCA {
-		return fmt.Errorf("intermediate certificate must be a CA")
+		return fmt.Errorf("промежуточный сертификат должен быть CA")
 	}
 
-	// 3. Verify root is a CA
+	// 3. Проверка, что корневой сертификат является CA
 	if !c.Root.IsCA {
-		return fmt.Errorf("root certificate must be a CA")
+		return fmt.Errorf("корневой сертификат должен быть CA")
 	}
 
-	// 4. Check validity periods
+	// 4. Проверка сроков действия
 	now := time.Now()
 	if now.Before(c.Leaf.NotBefore) || now.After(c.Leaf.NotAfter) {
-		return fmt.Errorf("leaf certificate is not valid at current time")
+		return fmt.Errorf("конечный сертификат недействителен в текущее время")
 	}
 	if now.Before(c.Intermediate.NotBefore) || now.After(c.Intermediate.NotAfter) {
-		return fmt.Errorf("intermediate certificate is not valid at current time")
+		return fmt.Errorf("промежуточный сертификат недействителен в текущее время")
 	}
 	if now.Before(c.Root.NotBefore) || now.After(c.Root.NotAfter) {
-		return fmt.Errorf("root certificate is not valid at current time")
+		return fmt.Errorf("корневой сертификат недействителен в текущее время")
 	}
 
-	// 5. Verify signatures
-	// Leaf signed by Intermediate
+	// 5. Проверка подписей
+	// Конечный сертификат подписан промежуточным CA
 	if err := c.Leaf.CheckSignatureFrom(c.Intermediate); err != nil {
-		return fmt.Errorf("leaf signature verification failed: %w", err)
+		return fmt.Errorf("проверка подписи конечного сертификата не пройдена: %w", err)
 	}
 
-	// Intermediate signed by Root
+	// Промежуточный CA подписан корневым CA
 	if err := c.Intermediate.CheckSignatureFrom(c.Root); err != nil {
-		return fmt.Errorf("intermediate signature verification failed: %w", err)
+		return fmt.Errorf("проверка подписи промежуточного CA не пройдена: %w", err)
 	}
 
-	// 6. Verify Key Usage for CA certificates
+	// 6. Проверка KeyUsage для CA сертификатов
 	requiredKeyUsage := x509.KeyUsageCertSign | x509.KeyUsageCRLSign
 	if c.Intermediate.KeyUsage&requiredKeyUsage != requiredKeyUsage {
-		return fmt.Errorf("intermediate CA missing required KeyUsage: keyCertSign and cRLSign")
+		return fmt.Errorf("у промежуточного CA отсутствуют обязательные KeyUsage: keyCertSign и cRLSign")
 	}
 	if c.Root.KeyUsage&requiredKeyUsage != requiredKeyUsage {
-		return fmt.Errorf("root CA missing required KeyUsage: keyCertSign and cRLSign")
+		return fmt.Errorf("у корневого CA отсутствуют обязательные KeyUsage: keyCertSign и cRLSign")
 	}
 
-	// 7. Verify path length constraints
+	// 7. Проверка ограничений длины пути
 	if err := c.verifyPathLength(); err != nil {
 		return err
 	}
@@ -126,22 +177,30 @@ func (c *Chain) Verify() error {
 	return nil
 }
 
-// verifyPathLength checks path length constraints
+// verifyPathLength проверяет ограничения длины пути в цепочке сертификатов.
+// Согласно RFC 5280, расширение Basic Constraints может содержать
+// ограничение на количество промежуточных CA ниже данного.
+//
+// Проверяет:
+//   - Ограничение длины пути в промежуточном CA (если установлено)
+//   - Ограничение длины пути в корневом CA (если установлено)
+//
+// Возвращает ошибку, если ограничения нарушены.
 func (c *Chain) verifyPathLength() error {
-	// Check intermediate's path length constraint
+	// Проверка ограничения длины пути в промежуточном CA
 	if c.Intermediate.MaxPathLen >= 0 {
-		// Path length of 0 means no further CAs below this one
+		// PathLen = 0 означает, что ниже этого CA не может быть других CA
 		if c.Intermediate.MaxPathLen == 0 {
-			// This is fine since leaf is not a CA
+			// Это нормально, так как конечный сертификат не является CA
 		}
 	}
 
-	// Check root's path length constraint if set
+	// Проверка ограничения длины пути в корневом CA (если установлено)
 	if c.Root.MaxPathLen >= 0 {
-		// Count number of CA certificates in chain (excluding root)
-		caCount := 1 // intermediate is CA
+		// Подсчёт количества CA сертификатов в цепочке (исключая корневой)
+		caCount := 1 // промежуточный CA
 		if caCount > c.Root.MaxPathLen {
-			return fmt.Errorf("path length constraint violated: chain length %d exceeds root's MaxPathLen %d",
+			return fmt.Errorf("нарушено ограничение длины пути: длина цепочки %d превышает MaxPathLen корневого CA %d",
 				caCount, c.Root.MaxPathLen)
 		}
 	}
@@ -149,15 +208,21 @@ func (c *Chain) verifyPathLength() error {
 	return nil
 }
 
-// VerifyWithOpenSSLCompatibility performs additional checks for OpenSSL compatibility
+// VerifyWithOpenSSLCompatibility выполняет дополнительные проверки для совместимости с OpenSSL.
+// OpenSSL более строг к некоторым расширениям, особенно к критичности Basic Constraints.
+//
+// Проверяет:
+//   - Для CA сертификатов расширение Basic Constraints должно быть критическим
+//
+// Возвращает ошибку, если обнаружены несовместимости, иначе nil.
 func (c *Chain) VerifyWithOpenSSLCompatibility() error {
-	// Verify basic constraints are critical
+	// Проверка критичности Basic Constraints для CA сертификатов
 	for _, cert := range []*x509.Certificate{c.Leaf, c.Intermediate, c.Root} {
 		for _, ext := range cert.Extensions {
-			// Check Basic Constraints extension (2.5.29.19)
+			// Проверка расширения Basic Constraints (OID 2.5.29.19)
 			if ext.Id.Equal([]int{2, 5, 29, 19}) {
 				if !ext.Critical && cert.IsCA {
-					return fmt.Errorf("Basic Constraints extension should be critical for CA certificates")
+					return fmt.Errorf("расширение Basic Constraints должно быть критическим для CA сертификатов")
 				}
 			}
 		}
@@ -166,44 +231,50 @@ func (c *Chain) VerifyWithOpenSSLCompatibility() error {
 	return nil
 }
 
-// PrintChainInfo prints human-readable information about the chain
+// PrintChainInfo возвращает читаемую информацию о цепочке сертификатов.
+// Полезна для отладки и вывода пользователю в командной строке.
+//
+// Возвращает многострочную строку с информацией о:
+//   - Корневом CA (субъект, издатель, серийный номер, срок действия)
+//   - Промежуточном CA (субъект, издатель, серийный номер, срок действия, ограничения)
+//   - Конечном сертификате (субъект, издатель, серийный номер, срок действия, имена)
 func (c *Chain) PrintChainInfo() string {
 	var info string
 
-	info += "Certificate Chain:\n"
-	info += "=================\n\n"
+	info += "Цепочка сертификатов:\n"
+	info += "====================\n\n"
 
-	info += "Root CA:\n"
-	info += fmt.Sprintf("  Subject: %s\n", c.Root.Subject)
-	info += fmt.Sprintf("  Issuer: %s\n", c.Root.Issuer)
-	info += fmt.Sprintf("  Serial: %X\n", c.Root.SerialNumber)
-	info += fmt.Sprintf("  Valid: %s to %s\n",
+	info += "Корневой CA:\n"
+	info += fmt.Sprintf("  Субъект: %s\n", c.Root.Subject)
+	info += fmt.Sprintf("  Издатель: %s\n", c.Root.Issuer)
+	info += fmt.Sprintf("  Серийный номер: %X\n", c.Root.SerialNumber)
+	info += fmt.Sprintf("  Действителен: с %s по %s\n",
 		c.Root.NotBefore.Format("2006-01-02"),
 		c.Root.NotAfter.Format("2006-01-02"))
-	info += fmt.Sprintf("  IsCA: %v\n", c.Root.IsCA)
+	info += fmt.Sprintf("  Является CA: %v\n", c.Root.IsCA)
 	info += "\n"
 
-	info += "Intermediate CA:\n"
-	info += fmt.Sprintf("  Subject: %s\n", c.Intermediate.Subject)
-	info += fmt.Sprintf("  Issuer: %s\n", c.Intermediate.Issuer)
-	info += fmt.Sprintf("  Serial: %X\n", c.Intermediate.SerialNumber)
-	info += fmt.Sprintf("  Valid: %s to %s\n",
+	info += "Промежуточный CA:\n"
+	info += fmt.Sprintf("  Субъект: %s\n", c.Intermediate.Subject)
+	info += fmt.Sprintf("  Издатель: %s\n", c.Intermediate.Issuer)
+	info += fmt.Sprintf("  Серийный номер: %X\n", c.Intermediate.SerialNumber)
+	info += fmt.Sprintf("  Действителен: с %s по %s\n",
 		c.Intermediate.NotBefore.Format("2006-01-02"),
 		c.Intermediate.NotAfter.Format("2006-01-02"))
-	info += fmt.Sprintf("  IsCA: %v\n", c.Intermediate.IsCA)
-	info += fmt.Sprintf("  PathLen: %d\n", c.Intermediate.MaxPathLen)
+	info += fmt.Sprintf("  Является CA: %v\n", c.Intermediate.IsCA)
+	info += fmt.Sprintf("  Ограничение длины пути: %d\n", c.Intermediate.MaxPathLen)
 	info += "\n"
 
-	info += "Leaf Certificate:\n"
-	info += fmt.Sprintf("  Subject: %s\n", c.Leaf.Subject)
-	info += fmt.Sprintf("  Issuer: %s\n", c.Leaf.Issuer)
-	info += fmt.Sprintf("  Serial: %X\n", c.Leaf.SerialNumber)
-	info += fmt.Sprintf("  Valid: %s to %s\n",
+	info += "Конечный сертификат:\n"
+	info += fmt.Sprintf("  Субъект: %s\n", c.Leaf.Subject)
+	info += fmt.Sprintf("  Издатель: %s\n", c.Leaf.Issuer)
+	info += fmt.Sprintf("  Серийный номер: %X\n", c.Leaf.SerialNumber)
+	info += fmt.Sprintf("  Действителен: с %s по %s\n",
 		c.Leaf.NotBefore.Format("2006-01-02"),
 		c.Leaf.NotAfter.Format("2006-01-02"))
-	info += fmt.Sprintf("  DNS Names: %v\n", c.Leaf.DNSNames)
-	info += fmt.Sprintf("  IP Addresses: %v\n", c.Leaf.IPAddresses)
-	info += fmt.Sprintf("  Email Addresses: %v\n", c.Leaf.EmailAddresses)
+	info += fmt.Sprintf("  DNS имена: %v\n", c.Leaf.DNSNames)
+	info += fmt.Sprintf("  IP адреса: %v\n", c.Leaf.IPAddresses)
+	info += fmt.Sprintf("  Email адреса: %v\n", c.Leaf.EmailAddresses)
 
 	return info
 }

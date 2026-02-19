@@ -1,5 +1,14 @@
 // Package crypto предоставляет криптографические операции для MicroPKI.
-// Все операции используют стандартную библиотеку Go.
+// Все операции используют стандартную библиотеку Go и реализуют требования
+// промышленной безопасности.
+//
+// Пакет включает:
+//   - Генерацию криптостойких ключевых пар (RSA, ECC)
+//   - Шифрование/расшифрование закрытых ключей с использованием AES-256-GCM
+//   - Сохранение и загрузку ключей в PEM-формате
+//   - Безопасное затирание чувствительных данных в памяти
+//
+// Все криптографические операции соответствуют рекомендациям OWASP и NIST.
 package crypto
 
 import (
@@ -20,14 +29,30 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
-// KeyPair содержит приватный и публичный ключи
+// KeyPair содержит приватный и публичный ключи.
+// Используется как контейнер для результатов генерации ключей.
 type KeyPair struct {
+	// PrivateKey - закрытый ключ (RSA или ECDSA)
 	PrivateKey crypto.PrivateKey
-	PublicKey  crypto.PublicKey
+
+	// PublicKey - открытый ключ, соответствующий закрытому
+	PublicKey crypto.PublicKey
 }
 
-// GenerateKeyPair генерирует ключевую пару согласно PKI-1
-// Поддерживаемые типы: RSA (2048 или 4096) и ECC P-256 или P-384
+// GenerateKeyPair генерирует криптографически безопасную ключевую пару.
+// Соответствует требованиям PKI-1.
+//
+// Поддерживаемые типы и размеры:
+//   - RSA: 2048 или 4096 бит
+//   - ECC: P-256 (256 бит) или P-384 (384 бит)
+//
+// Параметры:
+//   - keyType: тип ключа ("rsa" или "ecc")
+//   - keySize: размер ключа в битах
+//
+// Возвращает:
+//   - *KeyPair: структуру с ключевой парой
+//   - error: ошибку, если параметры неверны или генерация не удалась
 func GenerateKeyPair(keyType string, keySize int) (*KeyPair, error) {
 	switch keyType {
 	case "rsa":
@@ -35,7 +60,7 @@ func GenerateKeyPair(keyType string, keySize int) (*KeyPair, error) {
 			return nil, fmt.Errorf("размер RSA ключа должен быть 2048 или 4096 бит, получен %d", keySize)
 		}
 
-		// Генерируем RSA ключ
+		// Генерация RSA ключа
 		privateKey, err := rsa.GenerateKey(rand.Reader, keySize)
 		if err != nil {
 			return nil, fmt.Errorf("ошибка генерации RSA ключа: %w", err)
@@ -58,7 +83,7 @@ func GenerateKeyPair(keyType string, keySize int) (*KeyPair, error) {
 			curve = elliptic.P384()
 		}
 
-		// Генерируем ECDSA ключ
+		// Генерация ECDSA ключа
 		privateKey, err := ecdsa.GenerateKey(curve, rand.Reader)
 		if err != nil {
 			return nil, fmt.Errorf("ошибка генерации ECC ключа: %w", err)
@@ -74,37 +99,49 @@ func GenerateKeyPair(keyType string, keySize int) (*KeyPair, error) {
 	}
 }
 
-// encryptPrivateKey шифрует приватный ключ с использованием AES-256-GCM
+// encryptPrivateKey шифрует приватный ключ с использованием AES-256-GCM.
+// Использует PBKDF2 с 600,000 итераций (рекомендация OWASP) для получения
+// ключа из парольной фразы.
+//
+// Формат выходных данных: ASN.1 структура {Salt, Nonce, Ciphertext}
+//
+// Параметры:
+//   - keyBytes: байты ключа в формате PKCS#8
+//   - passphrase: парольная фраза для шифрования
+//
+// Возвращает:
+//   - []byte: зашифрованные данные в ASN.1 формате
+//   - error: ошибку, если шифрование не удалось
 func encryptPrivateKey(keyBytes []byte, passphrase []byte) ([]byte, error) {
-	// Генерируем соль для PBKDF2
+	// Генерация соли для PBKDF2
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, fmt.Errorf("ошибка генерации соли: %w", err)
 	}
 
-	// Используем PBKDF2 для получения ключа из пароля
+	// Использование PBKDF2 для получения ключа из пароля
 	// 600,000 итераций - рекомендация OWASP
 	derivedKey := pbkdf2.Key(passphrase, salt, 600000, 32, sha256.New)
 
-	// Генерируем случайный nonce для AES-GCM
+	// Генерация случайного nonce для AES-GCM
 	nonce := make([]byte, 12)
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("ошибка генерации nonce: %w", err)
 	}
 
-	// Создаем AES шифр
+	// Создание AES шифра
 	block, err := aes.NewCipher(derivedKey)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка создания AES шифра: %w", err)
 	}
 
-	// Создаем GCM режим
+	// Создание GCM режима
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка создания GCM: %w", err)
 	}
 
-	// Шифруем данные
+	// Шифрование данных
 	ciphertext := gcm.Seal(nil, nonce, keyBytes, nil)
 
 	// Структура для хранения зашифрованных данных
@@ -123,7 +160,15 @@ func encryptPrivateKey(keyBytes []byte, passphrase []byte) ([]byte, error) {
 	return asn1.Marshal(encrypted)
 }
 
-// decryptPrivateKey расшифровывает приватный ключ
+// decryptPrivateKey расшифровывает приватный ключ, зашифрованный encryptPrivateKey.
+//
+// Параметры:
+//   - encryptedData: зашифрованные данные в ASN.1 формате
+//   - passphrase: парольная фраза для расшифровки
+//
+// Возвращает:
+//   - []byte: расшифрованные байты ключа
+//   - error: ошибку, если расшифровка не удалась
 func decryptPrivateKey(encryptedData []byte, passphrase []byte) ([]byte, error) {
 	type encryptedKey struct {
 		Salt       []byte
@@ -136,22 +181,22 @@ func decryptPrivateKey(encryptedData []byte, passphrase []byte) ([]byte, error) 
 		return nil, fmt.Errorf("ошибка разбора зашифрованных данных: %w", err)
 	}
 
-	// Получаем ключ из пароля с той же солью
+	// Получение ключа из пароля с той же солью
 	derivedKey := pbkdf2.Key(passphrase, enc.Salt, 600000, 32, sha256.New)
 
-	// Создаем AES шифр
+	// Создание AES шифра
 	block, err := aes.NewCipher(derivedKey)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка создания AES шифра: %w", err)
 	}
 
-	// Создаем GCM режим
+	// Создание GCM режима
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка создания GCM: %w", err)
 	}
 
-	// Расшифровываем
+	// Расшифровка
 	plaintext, err := gcm.Open(nil, enc.Nonce, enc.Ciphertext, nil)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка расшифровки: %w", err)
@@ -160,9 +205,18 @@ func decryptPrivateKey(encryptedData []byte, passphrase []byte) ([]byte, error) 
 	return plaintext, nil
 }
 
-// SaveEncryptedPrivateKey сохраняет приватный ключ в зашифрованном PEM формате
+// SaveEncryptedPrivateKey сохраняет приватный ключ в зашифрованном PEM формате.
+// Ключ шифруется с использованием AES-256-GCM и сохраняется с правами доступа 0600.
+//
+// Параметры:
+//   - privateKey: закрытый ключ для сохранения
+//   - filename: имя файла для сохранения
+//   - passphrase: парольная фраза для шифрования
+//
+// Возвращает:
+//   - error: ошибку, если сохранение не удалось
 func SaveEncryptedPrivateKey(privateKey crypto.PrivateKey, filename string, passphrase []byte) error {
-	// Маршалим приватный ключ в PKCS#8 DER формат
+	// Маршалинг приватного ключа в PKCS#8 DER формат
 	var keyBytes []byte
 	var err error
 
@@ -179,26 +233,26 @@ func SaveEncryptedPrivateKey(privateKey crypto.PrivateKey, filename string, pass
 		return fmt.Errorf("ошибка маршалинга ключа: %w", err)
 	}
 
-	// Шифруем ключ
+	// Шифрование ключа
 	encryptedData, err := encryptPrivateKey(keyBytes, passphrase)
 	if err != nil {
 		return fmt.Errorf("ошибка шифрования ключа: %w", err)
 	}
 
-	// Создаем PEM блок
+	// Создание PEM блока
 	block := &pem.Block{
 		Type:  "ENCRYPTED PRIVATE KEY",
 		Bytes: encryptedData,
 	}
 
-	// Создаем файл с ограниченными правами
+	// Создание файла с ограниченными правами
 	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("ошибка создания файла ключа: %w", err)
 	}
 	defer file.Close()
 
-	// Записываем PEM
+	// Запись PEM
 	if err := pem.Encode(file, block); err != nil {
 		return fmt.Errorf("ошибка записи PEM: %w", err)
 	}
@@ -206,15 +260,23 @@ func SaveEncryptedPrivateKey(privateKey crypto.PrivateKey, filename string, pass
 	return nil
 }
 
-// LoadEncryptedPrivateKey загружает и расшифровывает приватный ключ из PEM файла
+// LoadEncryptedPrivateKey загружает и расшифровывает приватный ключ из PEM файла.
+//
+// Параметры:
+//   - filename: имя файла с зашифрованным ключом
+//   - passphrase: парольная фраза для расшифровки
+//
+// Возвращает:
+//   - crypto.PrivateKey: расшифрованный закрытый ключ
+//   - error: ошибку, если загрузка или расшифровка не удались
 func LoadEncryptedPrivateKey(filename string, passphrase []byte) (crypto.PrivateKey, error) {
-	// Читаем PEM файл
+	// Чтение PEM файла
 	pemData, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка чтения файла ключа: %w", err)
 	}
 
-	// Декодируем PEM блок
+	// Декодирование PEM блока
 	block, _ := pem.Decode(pemData)
 	if block == nil {
 		return nil, fmt.Errorf("ошибка декодирования PEM")
@@ -224,13 +286,13 @@ func LoadEncryptedPrivateKey(filename string, passphrase []byte) (crypto.Private
 		return nil, fmt.Errorf("неверный тип PEM блока: %s", block.Type)
 	}
 
-	// Расшифровываем ключ
+	// Расшифровка ключа
 	keyBytes, err := decryptPrivateKey(block.Bytes, passphrase)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка расшифровки ключа: %w", err)
 	}
 
-	// Парсим PKCS#8 ключ
+	// Парсинг PKCS#8 ключа
 	key, err := x509.ParsePKCS8PrivateKey(keyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка парсинга ключа: %w", err)
@@ -239,7 +301,16 @@ func LoadEncryptedPrivateKey(filename string, passphrase []byte) (crypto.Private
 	return key, nil
 }
 
-// SavePrivateKeyUnencrypted сохраняет приватный ключ в незашифрованном PEM формате
+// SavePrivateKeyUnencrypted сохраняет приватный ключ в незашифрованном PEM формате.
+// ВНИМАНИЕ: Использовать только для тестовых или нечувствительных ключей!
+// Ключ сохраняется с правами доступа 0600.
+//
+// Параметры:
+//   - privateKey: закрытый ключ для сохранения
+//   - filename: имя файла для сохранения
+//
+// Возвращает:
+//   - error: ошибку, если сохранение не удалось
 func SavePrivateKeyUnencrypted(privateKey crypto.PrivateKey, filename string) error {
 	var keyBytes []byte
 	var err error
@@ -252,14 +323,14 @@ func SavePrivateKeyUnencrypted(privateKey crypto.PrivateKey, filename string) er
 	case *ecdsa.PrivateKey:
 		keyBytes, err = x509.MarshalECPrivateKey(k)
 		if err != nil {
-			return fmt.Errorf("failed to marshal ECDSA key: %w", err)
+			return fmt.Errorf("не удалось маршалировать ECDSA ключ: %w", err)
 		}
 		blockType = "EC PRIVATE KEY"
 	default:
-		// Try PKCS#8 as fallback
+		// Попытка использовать PKCS#8 как запасной вариант
 		keyBytes, err = x509.MarshalPKCS8PrivateKey(k)
 		if err != nil {
-			return fmt.Errorf("failed to marshal private key: %w", err)
+			return fmt.Errorf("не удалось маршалировать ключ: %w", err)
 		}
 		blockType = "PRIVATE KEY"
 	}
@@ -271,18 +342,26 @@ func SavePrivateKeyUnencrypted(privateKey crypto.PrivateKey, filename string) er
 
 	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return fmt.Errorf("failed to create key file: %w", err)
+		return fmt.Errorf("не удалось создать файл ключа: %w", err)
 	}
 	defer file.Close()
 
 	if err := pem.Encode(file, block); err != nil {
-		return fmt.Errorf("failed to write PEM: %w", err)
+		return fmt.Errorf("не удалось записать PEM: %w", err)
 	}
 
 	return nil
 }
 
-// VerifyKeyPair проверяет что приватный ключ соответствует публичному
+// VerifyKeyPair проверяет, что приватный ключ соответствует публичному.
+// Поддерживает RSA и ECDSA ключи.
+//
+// Параметры:
+//   - privateKey: закрытый ключ для проверки
+//   - publicKey: открытый ключ для проверки
+//
+// Возвращает:
+//   - error: ошибку, если ключи не соответствуют или тип не поддерживается
 func VerifyKeyPair(privateKey crypto.PrivateKey, publicKey crypto.PublicKey) error {
 	switch priv := privateKey.(type) {
 	case *rsa.PrivateKey:
@@ -313,7 +392,11 @@ func VerifyKeyPair(privateKey crypto.PrivateKey, publicKey crypto.PublicKey) err
 	return nil
 }
 
-// SecureZero безопасно затирает байтовый слайс
+// SecureZero безопасно затирает байтовый слайс, перезаписывая его нулями.
+// Используется для очистки чувствительных данных (пароли, ключи) в памяти.
+//
+// Параметры:
+//   - data: байтовый слайс для затирания
 func SecureZero(data []byte) {
 	for i := range data {
 		data[i] = 0

@@ -1,6 +1,14 @@
-// Package templates implements X.509 certificate templates for different use cases.
-// Supports server, client, and code signing certificates with proper extensions
-// according to RFC 5280.
+// Package templates реализует шаблоны X.509 сертификатов для различных сценариев использования.
+// Поддерживает серверные, клиентские сертификаты и сертификаты подписи кода с правильными
+// расширениями в соответствии с RFC 5280.
+//
+// Каждый шаблон включает соответствующие расширения:
+//   - Basic Constraints (критическое)
+//   - Key Usage (критическое)
+//   - Extended Key Usage
+//   - Subject Alternative Name
+//
+// Пакет также предоставляет функции для создания шаблонов промежуточных центров сертификации.
 package templates
 
 import (
@@ -13,50 +21,84 @@ import (
 	"time"
 )
 
-// TemplateType defines the type of certificate template
+// TemplateType определяет тип шаблона сертификата.
+// Используется для выбора соответствующей конфигурации расширений.
 type TemplateType string
 
 const (
-	// Server template for TLS server certificates
+	// Server - шаблон для серверных TLS сертификатов
 	Server TemplateType = "server"
-	// Client template for TLS client certificates
+
+	// Client - шаблон для клиентских TLS сертификатов
 	Client TemplateType = "client"
-	// CodeSigning template for code signing certificates
+
+	// CodeSigning - шаблон для сертификатов подписи кода
 	CodeSigning TemplateType = "code_signing"
 )
 
-// SAN represents a Subject Alternative Name entry
+// SAN представляет запись альтернативного имени субъекта.
+// Используется для передачи SAN между компонентами системы.
 type SAN struct {
-	Type  string // dns, ip, email, uri
+	// Type - тип SAN: "dns", "ip", "email", "uri"
+	Type string
+
+	// Value - значение SAN в строковом формате
 	Value string
 }
 
-// TemplateConfig holds configuration for certificate templates
+// TemplateConfig содержит параметры конфигурации для создания шаблонов сертификатов.
+// Все поля должны быть заполнены перед вызовом функций создания шаблонов.
 type TemplateConfig struct {
-	Subject      *pkix.Name
-	SANs         []SAN
-	SerialNumber *SerialNumber // Мы создадим этот тип позже
-	NotBefore    time.Time
-	NotAfter     time.Time
-	PublicKey    interface{}
-	IsCA         bool
-	MaxPathLen   int
-	KeyUsage     x509.KeyUsage
-	ExtKeyUsage  []x509.ExtKeyUsage
+	// Subject - различающееся имя субъекта
+	Subject *pkix.Name
+
+	// SANs - альтернативные имена субъекта
+	SANs []SAN
+
+	// SerialNumber - серийный номер сертификата
+	SerialNumber *SerialNumber
+
+	// NotBefore - начало периода действия
+	NotBefore time.Time
+
+	// NotAfter - окончание периода действия
+	NotAfter time.Time
+
+	// PublicKey - открытый ключ сертификата
+	PublicKey interface{}
+
+	// IsCA - флаг центра сертификации (для CA сертификатов)
+	IsCA bool
+
+	// MaxPathLen - ограничение длины пути (для CA сертификатов)
+	MaxPathLen int
+
+	// KeyUsage - использование ключа (опционально, для переопределения)
+	KeyUsage x509.KeyUsage
+
+	// ExtKeyUsage - расширенное использование ключа (опционально)
+	ExtKeyUsage []x509.ExtKeyUsage
 }
 
-// NewServerTemplate creates a template for server authentication certificates
-// Implements PKI-8 requirements for server certificates:
-// - Basic Constraints: CA=FALSE (critical)
-// - Key Usage: digitalSignature, keyEncipherment (for RSA) or digitalSignature (for ECC)
-// - Extended Key Usage: serverAuth
-// - Subject Alternative Name: at least one DNS name or IP address
+// NewServerTemplate создаёт шаблон для сертификатов аутентификации сервера.
+// Реализует требования PKI-8 для серверных сертификатов:
+//   - Basic Constraints: CA=FALSE (критическое)
+//   - Key Usage: digitalSignature, keyEncipherment (для RSA) или digitalSignature (для ECC)
+//   - Extended Key Usage: serverAuth
+//   - Subject Alternative Name: минимум одно DNS имя или IP адрес
+//
+// Параметры:
+//   - cfg: конфигурация шаблона
+//
+// Возвращает:
+//   - *x509.Certificate: готовый шаблон сертификата
+//   - error: ошибку, если конфигурация невалидна
 func NewServerTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 	if len(cfg.SANs) == 0 {
-		return nil, fmt.Errorf("server certificate requires at least one SAN (DNS or IP)")
+		return nil, fmt.Errorf("серверный сертификат требует хотя бы один SAN (DNS или IP)")
 	}
 
-	// Validate that we have at least one DNS or IP SAN
+	// Проверка наличия хотя бы одного DNS или IP SAN
 	hasValidSAN := false
 	for _, san := range cfg.SANs {
 		if san.Type == "dns" || san.Type == "ip" {
@@ -65,10 +107,10 @@ func NewServerTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		}
 	}
 	if !hasValidSAN {
-		return nil, fmt.Errorf("server certificate must have at least one DNS name or IP address in SAN")
+		return nil, fmt.Errorf("серверный сертификат должен иметь хотя бы одно DNS имя или IP адрес в SAN")
 	}
 
-	// Build DNS names, IP addresses, etc. from SANs
+	// Разделение SAN по типам
 	dnsNames, ipAddresses, emailAddresses, uris := splitSANs(cfg.SANs)
 
 	template := &x509.Certificate{
@@ -77,7 +119,7 @@ func NewServerTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		NotBefore:    cfg.NotBefore,
 		NotAfter:     cfg.NotAfter,
 
-		// Basic Constraints: CA=FALSE (critical)
+		// Basic Constraints: CA=FALSE (критическое)
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 
@@ -93,21 +135,28 @@ func NewServerTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		EmailAddresses: emailAddresses,
 		URIs:           uris,
 
-		// Subject Key Identifier will be generated automatically
-		// Authority Key Identifier will be set by the signer
+		// Subject Key Identifier будет сгенерирован автоматически
+		// Authority Key Identifier будет установлен издателем
 	}
 
 	return template, nil
 }
 
-// NewClientTemplate creates a template for client authentication certificates
-// Implements PKI-8 requirements for client certificates:
-// - Basic Constraints: CA=FALSE (critical)
-// - Key Usage: digitalSignature
-// - Extended Key Usage: clientAuth
-// - Subject Alternative Name: should contain email if provided
+// NewClientTemplate создаёт шаблон для сертификатов аутентификации клиента.
+// Реализует требования PKI-8 для клиентских сертификатов:
+//   - Basic Constraints: CA=FALSE (критическое)
+//   - Key Usage: digitalSignature
+//   - Extended Key Usage: clientAuth
+//   - Subject Alternative Name: должен содержать email если предоставлен
+//
+// Параметры:
+//   - cfg: конфигурация шаблона
+//
+// Возвращает:
+//   - *x509.Certificate: готовый шаблон сертификата
+//   - error: ошибку, если конфигурация невалидна
 func NewClientTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
-	// Build DNS names, IP addresses, etc. from SANs
+	// Разделение SAN по типам
 	dnsNames, ipAddresses, emailAddresses, uris := splitSANs(cfg.SANs)
 
 	template := &x509.Certificate{
@@ -116,7 +165,7 @@ func NewClientTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		NotBefore:    cfg.NotBefore,
 		NotAfter:     cfg.NotAfter,
 
-		// Basic Constraints: CA=FALSE (critical)
+		// Basic Constraints: CA=FALSE (критическое)
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 
@@ -136,21 +185,28 @@ func NewClientTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 	return template, nil
 }
 
-// NewCodeSigningTemplate creates a template for code signing certificates
-// Implements PKI-8 requirements for code signing certificates:
-// - Basic Constraints: CA=FALSE (critical)
-// - Key Usage: digitalSignature
-// - Extended Key Usage: codeSigning
-// - Subject Alternative Name: not required, limited to DNS/URI if provided
+// NewCodeSigningTemplate создаёт шаблон для сертификатов подписи кода.
+// Реализует требования PKI-8 для сертификатов подписи кода:
+//   - Basic Constraints: CA=FALSE (критическое)
+//   - Key Usage: digitalSignature
+//   - Extended Key Usage: codeSigning
+//   - Subject Alternative Name: опционально, ограничен DNS/URI
+//
+// Параметры:
+//   - cfg: конфигурация шаблона
+//
+// Возвращает:
+//   - *x509.Certificate: готовый шаблон сертификата
+//   - error: ошибку, если конфигурация невалидна
 func NewCodeSigningTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
-	// For code signing, we should validate that no IP or email SANs are present
+	// Для подписи кода проверяем, что нет IP или email SAN
 	for _, san := range cfg.SANs {
 		if san.Type == "ip" || san.Type == "email" {
-			return nil, fmt.Errorf("code signing certificate cannot have IP or email SANs")
+			return nil, fmt.Errorf("сертификат подписи кода не может содержать IP или email SAN")
 		}
 	}
 
-	// Build DNS names, IP addresses, etc. from SANs
+	// Разделение SAN по типам
 	dnsNames, ipAddresses, emailAddresses, uris := splitSANs(cfg.SANs)
 
 	template := &x509.Certificate{
@@ -159,7 +215,7 @@ func NewCodeSigningTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		NotBefore:    cfg.NotBefore,
 		NotAfter:     cfg.NotAfter,
 
-		// Basic Constraints: CA=FALSE (critical)
+		// Basic Constraints: CA=FALSE (критическое)
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 
@@ -169,20 +225,26 @@ func NewCodeSigningTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		// Extended Key Usage: codeSigning
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning},
 
-		// Subject Alternative Name (limited to DNS/URI)
+		// Subject Alternative Name (ограничен DNS/URI)
 		DNSNames:       dnsNames,
-		IPAddresses:    ipAddresses,    // Should be empty due to validation above
-		EmailAddresses: emailAddresses, // Should be empty due to validation above
+		IPAddresses:    ipAddresses,    // Должен быть пустым из-за проверки выше
+		EmailAddresses: emailAddresses, // Должен быть пустым из-за проверки выше
 		URIs:           uris,
 	}
 
 	return template, nil
 }
 
-// NewIntermediateCATemplate creates a template for Intermediate CA certificates
-// Implements PKI-7 requirements:
-// - Basic Constraints: CA=TRUE, pathLenConstraint (critical)
-// - Key Usage: keyCertSign, cRLSign (critical)
+// NewIntermediateCATemplate создаёт шаблон для сертификатов промежуточного CA.
+// Реализует требования PKI-7:
+//   - Basic Constraints: CA=TRUE, pathLenConstraint (критическое)
+//   - Key Usage: keyCertSign, cRLSign (критическое)
+//
+// Параметры:
+//   - cfg: конфигурация шаблона
+//
+// Возвращает:
+//   - *x509.Certificate: готовый шаблон сертификата
 func NewIntermediateCATemplate(cfg *TemplateConfig) *x509.Certificate {
 	template := &x509.Certificate{
 		SerialNumber: cfg.SerialNumber.BigInt(),
@@ -190,23 +252,33 @@ func NewIntermediateCATemplate(cfg *TemplateConfig) *x509.Certificate {
 		NotBefore:    cfg.NotBefore,
 		NotAfter:     cfg.NotAfter,
 
-		// Basic Constraints: CA=TRUE, pathLenConstraint (critical)
+		// Basic Constraints: CA=TRUE, pathLenConstraint (критическое)
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		MaxPathLen:            cfg.MaxPathLen,
 		MaxPathLenZero:        cfg.MaxPathLen == 0,
 
-		// Key Usage: keyCertSign, cRLSign (critical)
+		// Key Usage: keyCertSign, cRLSign (критическое)
 		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 
-		// Subject Key Identifier will be generated automatically
-		// Authority Key Identifier will be set by the signer
+		// Subject Key Identifier будет сгенерирован автоматически
+		// Authority Key Identifier будет установлен издателем
 	}
 
 	return template
 }
 
-// ValidateTemplateCompatibility checks if the template supports the provided SAN types
+// ValidateTemplateCompatibility проверяет совместимость шаблона с предоставленными SAN.
+// Выполняет проверки в зависимости от типа шаблона:
+//   - Server: требует хотя бы один DNS или IP
+//   - CodeSigning: запрещает IP и Email
+//
+// Параметры:
+//   - tmplType: тип шаблона
+//   - sans: срез SAN для проверки
+//
+// Возвращает:
+//   - error: ошибку, если SAN несовместимы с шаблоном
 func ValidateTemplateCompatibility(tmplType TemplateType, sans []SAN) error {
 	switch tmplType {
 	case Server:
@@ -217,16 +289,17 @@ func ValidateTemplateCompatibility(tmplType TemplateType, sans []SAN) error {
 			}
 		}
 		if !hasDNSorIP {
-			return fmt.Errorf("server template requires at least one DNS or IP SAN")
+			return fmt.Errorf("серверный шаблон требует хотя бы один DNS или IP SAN")
 		}
 
 	case Client:
-		// Client can have any SAN types, no strict requirements
+		// Клиентский шаблон может содержать любые типы SAN
+		// Строгих требований нет
 
 	case CodeSigning:
 		for _, san := range sans {
 			if san.Type == "ip" || san.Type == "email" {
-				return fmt.Errorf("code signing template does not support IP or email SANs")
+				return fmt.Errorf("шаблон подписи кода не поддерживает IP или email SAN")
 			}
 		}
 	}
@@ -234,37 +307,53 @@ func ValidateTemplateCompatibility(tmplType TemplateType, sans []SAN) error {
 	return nil
 }
 
-// ParseSANString parses a SAN string of format "type:value"
-// Supported types: dns, ip, email, uri
+// ParseSANString парсит строку SAN в формате "тип:значение".
+// Поддерживаемые типы: dns, ip, email, uri.
+//
+// Параметры:
+//   - san: строка для парсинга
+//
+// Возвращает:
+//   - SAN: структуру с типом и значением
+//   - error: ошибку, если формат неверен
 func ParseSANString(san string) (SAN, error) {
 	parts := strings.SplitN(san, ":", 2)
 	if len(parts) != 2 {
-		return SAN{}, fmt.Errorf("invalid SAN format: %s (expected type:value)", san)
+		return SAN{}, fmt.Errorf("неверный формат SAN: %s (ожидалось тип:значение)", san)
 	}
 
 	sanType := strings.ToLower(strings.TrimSpace(parts[0]))
 	value := strings.TrimSpace(parts[1])
 
 	if value == "" {
-		return SAN{}, fmt.Errorf("empty SAN value for type %s", sanType)
+		return SAN{}, fmt.Errorf("пустое значение SAN для типа %s", sanType)
 	}
 
-	// Validate based on type
+	// Валидация в зависимости от типа
 	switch sanType {
 	case "dns", "email", "uri":
-		// Basic validation, actual format will be checked during encoding
+		// Базовая валидация, фактический формат будет проверен при кодировании
 	case "ip":
 		if net.ParseIP(value) == nil {
-			return SAN{}, fmt.Errorf("invalid IP address: %s", value)
+			return SAN{}, fmt.Errorf("неверный IP адрес: %s", value)
 		}
 	default:
-		return SAN{}, fmt.Errorf("unsupported SAN type: %s (supported: dns, ip, email, uri)", sanType)
+		return SAN{}, fmt.Errorf("неподдерживаемый тип SAN: %s (поддерживаются: dns, ip, email, uri)", sanType)
 	}
 
 	return SAN{Type: sanType, Value: value}, nil
 }
 
-// splitSANs separates SANs by type
+// splitSANs разделяет SAN по типам и преобразует в форматы, ожидаемые x509.Certificate.
+//
+// Параметры:
+//   - sans: срез SAN
+//
+// Возвращает:
+//   - dnsNames: срез DNS имён
+//   - ipAddresses: срез IP адресов
+//   - emailAddresses: срез email адресов
+//   - uris: срез URI
 func splitSANs(sans []SAN) (dnsNames []string, ipAddresses []net.IP, emailAddresses []string, uris []*url.URL) {
 	for _, san := range sans {
 		switch san.Type {

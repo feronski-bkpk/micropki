@@ -1,5 +1,13 @@
-// Package san implements Subject Alternative Name parsing and validation
-// according to RFC 5280.
+// Package san реализует парсинг и валидацию альтернативных имён субъекта (SAN)
+// в соответствии с RFC 5280 (Internet X.509 Public Key Infrastructure).
+//
+// Пакет поддерживает четыре типа SAN:
+//   - DNS имена (dns)
+//   - IP адреса (ip)
+//   - Email адреса (email)
+//   - URI (uri)
+//
+// Все операции включают валидацию формата в соответствии со спецификациями.
 package san
 
 import (
@@ -10,60 +18,91 @@ import (
 	"micropki/micropki/internal/templates"
 )
 
-// SANType defines the type of Subject Alternative Name
+// SANType определяет тип альтернативного имени субъекта.
+// Соответствует типам, определённым в RFC 5280, раздел 4.2.1.6.
 type SANType string
 
 const (
-	DNS   SANType = "dns"
-	IP    SANType = "ip"
+	// DNS представляет доменное имя (например, "example.com")
+	DNS SANType = "dns"
+
+	// IP представляет IPv4 или IPv6 адрес
+	IP SANType = "ip"
+
+	// Email представляет email адрес в формате RFC 822
 	Email SANType = "email"
-	URI   SANType = "uri"
+
+	// URI представляет унифицированный идентификатор ресурса
+	URI SANType = "uri"
 )
 
-// SAN represents a parsed Subject Alternative Name
+// SAN представляет разобранное альтернативное имя субъекта.
+// Содержит тип и значение, прошедшее базовую валидацию.
 type SAN struct {
-	Type  SANType
+	// Type - тип SAN (dns, ip, email, uri)
+	Type SANType
+
+	// Value - значение SAN в строковом представлении
 	Value string
 }
 
-// ParseSAN parses a string of format "type:value"
-// Supported types: dns, ip, email, uri
+// ParseSAN парсит строку в формате "тип:значение".
+// Поддерживаемые типы: dns, ip, email, uri.
+//
+// Параметры:
+//   - san: строка для парсинга (например, "dns:example.com")
+//
+// Возвращает:
+//   - SAN: структуру с типом и значением
+//   - error: ошибку, если формат неверен или валидация не пройдена
+//
+// Примеры:
+//   - "dns:example.com" → SAN{Type: DNS, Value: "example.com"}
+//   - "ip:192.168.1.1" → SAN{Type: IP, Value: "192.168.1.1"}
+//   - "email:user@example.com" → SAN{Type: Email, Value: "user@example.com"}
+//   - "uri:https://example.com" → SAN{Type: URI, Value: "https://example.com"}
 func ParseSAN(san string) (SAN, error) {
 	parts := strings.SplitN(san, ":", 2)
 	if len(parts) != 2 {
-		return SAN{}, fmt.Errorf("invalid SAN format: %s (expected type:value)", san)
+		return SAN{}, fmt.Errorf("неверный формат SAN: %s (ожидалось тип:значение)", san)
 	}
 
 	sanType := strings.ToLower(strings.TrimSpace(parts[0]))
 	value := strings.TrimSpace(parts[1])
 
 	if value == "" {
-		return SAN{}, fmt.Errorf("empty SAN value for type %s", sanType)
+		return SAN{}, fmt.Errorf("пустое значение SAN для типа %s", sanType)
 	}
 
-	// Validate based on type
+	// Валидация в зависимости от типа
 	switch sanType {
 	case "dns":
-		// DNS validation - basic check for now
+		// Базовая проверка DNS - непустое значение
 		if len(value) == 0 {
-			return SAN{}, fmt.Errorf("empty DNS name")
+			return SAN{}, fmt.Errorf("пустое DNS имя")
 		}
+		// Дополнительная валидация может быть добавлена позже
+
 	case "ip":
 		if net.ParseIP(value) == nil {
-			return SAN{}, fmt.Errorf("invalid IP address: %s", value)
+			return SAN{}, fmt.Errorf("неверный IP адрес: %s", value)
 		}
+
 	case "email":
-		// Basic email validation - should contain @
+		// Базовая проверка email - наличие @
 		if !strings.Contains(value, "@") {
-			return SAN{}, fmt.Errorf("invalid email address: %s", value)
+			return SAN{}, fmt.Errorf("неверный email адрес: %s", value)
 		}
+		// Полная валидация по RFC 822 может быть добавлена позже
+
 	case "uri":
-		// Basic URI validation - should start with scheme
+		// Базовая проверка URI - наличие схемы (://)
 		if !strings.Contains(value, "://") {
-			return SAN{}, fmt.Errorf("invalid URI: %s (should contain scheme)", value)
+			return SAN{}, fmt.Errorf("неверный URI: %s (должен содержать схему)", value)
 		}
+
 	default:
-		return SAN{}, fmt.Errorf("unsupported SAN type: %s (supported: dns, ip, email, uri)", sanType)
+		return SAN{}, fmt.Errorf("неподдерживаемый тип SAN: %s (поддерживаются: dns, ip, email, uri)", sanType)
 	}
 
 	return SAN{
@@ -72,31 +111,42 @@ func ParseSAN(san string) (SAN, error) {
 	}, nil
 }
 
-// ValidateSANTypes checks if the provided SANs are compatible with the template
+// ValidateSANTypes проверяет совместимость предоставленных SAN с шаблоном сертификата.
+// Выполняет проверки в зависимости от типа сертификата:
+//   - Server: требует хотя бы один DNS или IP
+//   - Client: любые типы допустимы
+//   - CodeSigning: запрещает IP и Email
+//
+// Параметры:
+//   - tmplType: тип шаблона сертификата
+//   - sans: срез строк SAN для проверки
+//
+// Возвращает:
+//   - error: ошибку, если SAN несовместимы с шаблоном
 func ValidateSANTypes(tmplType templates.TemplateType, sans []string) error {
 	if len(sans) == 0 {
-		// Server certificates require at least one SAN
+		// Серверные сертификаты требуют хотя бы один SAN
 		if tmplType == templates.Server {
-			return fmt.Errorf("server certificate requires at least one SAN (DNS or IP)")
+			return fmt.Errorf("серверный сертификат требует хотя бы один SAN (DNS или IP)")
 		}
-		// Client and CodeSigning can have no SANs
+		// Клиентские сертификаты и сертификаты подписи кода могут быть без SAN
 		return nil
 	}
 
-	// Parse and validate each SAN
+	// Парсинг и валидация каждого SAN
 	parsedSANs := make([]SAN, 0, len(sans))
 	for _, san := range sans {
 		parsed, err := ParseSAN(san)
 		if err != nil {
-			return fmt.Errorf("invalid SAN '%s': %w", san, err)
+			return fmt.Errorf("неверный SAN '%s': %w", san, err)
 		}
 		parsedSANs = append(parsedSANs, parsed)
 	}
 
-	// Template-specific validations
+	// Проверки, специфичные для типа шаблона
 	switch tmplType {
 	case templates.Server:
-		// Server must have at least one DNS or IP
+		// Серверный сертификат должен иметь хотя бы один DNS или IP
 		hasDNSorIP := false
 		for _, san := range parsedSANs {
 			if san.Type == DNS || san.Type == IP {
@@ -105,20 +155,21 @@ func ValidateSANTypes(tmplType templates.TemplateType, sans []string) error {
 			}
 		}
 		if !hasDNSorIP {
-			return fmt.Errorf("server certificate requires at least one DNS or IP SAN")
+			return fmt.Errorf("серверный сертификат требует хотя бы один DNS или IP SAN")
 		}
 
 	case templates.Client:
-		// Client can have any types, no additional validation needed
+		// Клиентский сертификат может иметь любые типы
+		// Дополнительная валидация не требуется
 
 	case templates.CodeSigning:
-		// Code signing should not have IP or Email SANs
+		// Сертификат подписи кода не должен иметь IP или Email SAN
 		for _, san := range parsedSANs {
 			if san.Type == IP {
-				return fmt.Errorf("code signing certificate cannot have IP SANs")
+				return fmt.Errorf("сертификат подписи кода не может содержать IP SAN")
 			}
 			if san.Type == Email {
-				return fmt.Errorf("code signing certificate cannot have Email SANs")
+				return fmt.Errorf("сертификат подписи кода не может содержать Email SAN")
 			}
 		}
 	}
@@ -126,8 +177,17 @@ func ValidateSANTypes(tmplType templates.TemplateType, sans []string) error {
 	return nil
 }
 
-// ExtractSANs extracts SANs from a certificate request or certificate
-// This is a helper function to get SANs in a consistent format
+// ExtractSANs извлекает SAN из компонентов сертификата или запроса.
+// Функция-помощник для получения SAN в единообразном формате.
+//
+// Параметры:
+//   - dnsNames: срез DNS имён
+//   - ipAddresses: срез IP адресов
+//   - emailAddresses: срез email адресов
+//   - uris: срез URI строк
+//
+// Возвращает:
+//   - []SAN: срез структур SAN
 func ExtractSANs(dnsNames []string, ipAddresses []net.IP, emailAddresses []string, uris []string) []SAN {
 	var sans []SAN
 
@@ -150,7 +210,8 @@ func ExtractSANs(dnsNames []string, ipAddresses []net.IP, emailAddresses []strin
 	return sans
 }
 
-// String returns the string representation of a SAN in "type:value" format
+// String возвращает строковое представление SAN в формате "тип:значение".
+// Реализует интерфейс fmt.Stringer.
 func (s SAN) String() string {
 	return fmt.Sprintf("%s:%s", s.Type, s.Value)
 }

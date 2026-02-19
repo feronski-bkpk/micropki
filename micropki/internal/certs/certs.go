@@ -1,5 +1,13 @@
 // Package certs обрабатывает операции с X.509 сертификатами.
-// Предоставляет функции для генерации, парсинга и валидации сертификатов.
+// Пакет предоставляет функции для:
+//   - Парсинга Distinguished Name (DN) из строковых представлений
+//   - Генерации криптографически безопасных серийных номеров
+//   - Создания шаблонов сертификатов для различных типов CA
+//   - Загрузки и сохранения сертификатов в PEM-формате
+//   - Проверки сертификатов и их соответствия ключам
+//   - Извлечения информации о сертификатах и алгоритмах ключей
+//
+// Пакет реализует требования PKI-2, PKI-3 и поддерживает как RSA, так и ECC ключи.
 package certs
 
 import (
@@ -23,6 +31,16 @@ import (
 //   - Слэш-формат: /CN=.../O=.../C=...
 //   - Формат с запятыми: CN=..., O=..., C=...
 //
+// Поддерживаемые атрибуты:
+//   - CN: Common Name
+//   - O: Organization
+//   - OU: Organizational Unit
+//   - C: Country
+//   - ST: State/Province
+//   - L: Locality/City
+//
+// Неизвестные атрибуты сохраняются в ExtraNames для обратной совместимости.
+//
 // Возвращает ошибку, если строка пустая или имеет неверный формат.
 func ParseDN(dn string) (*pkix.Name, error) {
 	name := &pkix.Name{}
@@ -32,7 +50,7 @@ func ParseDN(dn string) (*pkix.Name, error) {
 		return nil, fmt.Errorf("пустая строка DN")
 	}
 
-	// Определяем формат по первому символу
+	// Определение формата по первому символу
 	if strings.HasPrefix(dn, "/") {
 		return parseSlashFormat(dn, name)
 	}
@@ -40,6 +58,7 @@ func ParseDN(dn string) (*pkix.Name, error) {
 }
 
 // parseSlashFormat парсит DN в формате: /CN=.../O=.../C=...
+// Внутренняя функция, не экспортируется.
 func parseSlashFormat(dn string, name *pkix.Name) (*pkix.Name, error) {
 	// Убираем ведущий слэш и разбиваем на части
 	parts := strings.Split(dn[1:], "/")
@@ -58,7 +77,7 @@ func parseSlashFormat(dn string, name *pkix.Name) (*pkix.Name, error) {
 		key := strings.TrimSpace(kv[0])
 		value := strings.TrimSpace(kv[1])
 
-		// Заполняем соответствующие поля в зависимости от ключа
+		// Заполнение соответствующих полей в зависимости от ключа
 		switch key {
 		case "CN":
 			name.CommonName = value
@@ -85,6 +104,7 @@ func parseSlashFormat(dn string, name *pkix.Name) (*pkix.Name, error) {
 }
 
 // parseCommaFormat парсит DN в формате: CN=..., O=..., C=...
+// Внутренняя функция, не экспортируется.
 func parseCommaFormat(dn string, name *pkix.Name) (*pkix.Name, error) {
 	// Разбиваем по запятым
 	parts := strings.Split(dn, ",")
@@ -99,7 +119,7 @@ func parseCommaFormat(dn string, name *pkix.Name) (*pkix.Name, error) {
 		key := strings.TrimSpace(kv[0])
 		value := strings.TrimSpace(kv[1])
 
-		// Заполняем поля (для O, OU, C, ST, L может быть несколько значений)
+		// Заполнение полей (для O, OU, C, ST, L может быть несколько значений)
 		switch key {
 		case "CN":
 			name.CommonName = value
@@ -127,17 +147,22 @@ func parseCommaFormat(dn string, name *pkix.Name) (*pkix.Name, error) {
 
 // GenerateSerialNumber генерирует криптографически безопасный серийный номер.
 // Требование PKI-2: минимум 20 бит энтропии.
-// Реализация: используем 20 байт (160 бит) для надежности.
+// Реализация: используется 20 байт (160 бит) из криптографически безопасного
+// генератора случайных чисел для обеспечения уникальности и непредсказуемости.
+//
+// Старший бит сбрасывается для гарантии положительного числа согласно X.509.
+//
+// Возвращает ошибку, если генератор случайных чисел недоступен.
 func GenerateSerialNumber() (*big.Int, error) {
 	serialBytes := make([]byte, 20) // 160 бит энтропии
 
-	// Используем криптографически безопасный генератор случайных чисел
+	// Использование криптографически безопасного генератора случайных чисел
 	_, err := rand.Read(serialBytes)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка генерации серийного номера: %w", err)
 	}
 
-	// Убеждаемся что число положительное (сбрасываем старший бит)
+	// Обеспечение положительного числа (сброс старшего бита)
 	serialBytes[0] &= 0x7F
 
 	return new(big.Int).SetBytes(serialBytes), nil
@@ -145,15 +170,23 @@ func GenerateSerialNumber() (*big.Int, error) {
 
 // NewRootCATemplate создает шаблон самоподписанного сертификата Root CA.
 // Реализует требования PKI-2 и PKI-3:
-//   - X.509v3
-//   - BasicConstraints: CA=TRUE (критический)
-//   - KeyUsage: keyCertSign, cRLSign (критический)
-//   - SubjectKeyIdentifier и AuthorityKeyIdentifier
+//   - Версия X.509v3
+//   - BasicConstraints: CA=TRUE (критическое расширение)
+//   - KeyUsage: keyCertSign, cRLSign (критическое расширение)
+//   - SubjectKeyIdentifier и AuthorityKeyIdentifier (генерируются автоматически)
+//
+// Параметры:
+//   - subject, issuer: для самоподписанного сертификата должны совпадать
+//   - serialNumber: уникальный серийный номер (из GenerateSerialNumber)
+//   - notBefore, notAfter: период действия сертификата
+//   - publicKey: открытый ключ сертификата
+//
+// Возвращает шаблон сертификата, готовый для подписания.
 func NewRootCATemplate(subject, issuer *pkix.Name, serialNumber *big.Int,
 	notBefore, notAfter time.Time, publicKey crypto.PublicKey) *x509.Certificate {
 
 	return &x509.Certificate{
-		// Версия 3 (значение 2 в X.509)
+		// Версия 3 (значение 2 в структуре X.509)
 		Version:      2,
 		SerialNumber: serialNumber,
 		Subject:      *subject,
@@ -170,20 +203,25 @@ func NewRootCATemplate(subject, issuer *pkix.Name, serialNumber *big.Int,
 		// BasicConstraints - критическое расширение, CA=TRUE (PKI-3)
 		BasicConstraintsValid: true,
 		IsCA:                  true,
-		MaxPathLen:            -1, // Без ограничения длины пути
+		MaxPathLen:            -1, // -1 означает отсутствие ограничения длины пути
 
-		// SubjectKeyIdentifier будет сгенерирован автоматически
+		// SubjectKeyIdentifier будет сгенерирован автоматически при создании
 		// AuthorityKeyIdentifier будет установлен в то же значение для самоподписанного
 	}
 }
 
 // CertificateMatchesPrivateKey проверяет соответствие сертификата приватному ключу.
-// Используется для тестирования (TEST-2).
+// Используется для тестирования (TEST-2) и верификации.
+//
+// Поддерживает RSA и ECDSA ключи. Для RSA проверяет модуль и публичную экспоненту,
+// для ECDSA - координаты точки и используемую кривую.
+//
+// Возвращает ошибку, если ключи не соответствуют или тип ключа не поддерживается.
 func CertificateMatchesPrivateKey(cert *x509.Certificate, privateKey crypto.PrivateKey) error {
-	// Проверяем соответствие публичного ключа в сертификате и приватного ключа
+	// Проверка соответствия публичного ключа в сертификате и приватного ключа
 	switch priv := privateKey.(type) {
 	case *rsa.PrivateKey:
-		// Для RSA проверяем модуль и публичную экспоненту
+		// Для RSA проверка модуля и публичной экспоненты
 		pub, ok := cert.PublicKey.(*rsa.PublicKey)
 		if !ok {
 			return fmt.Errorf("публичный ключ в сертификате не RSA")
@@ -193,7 +231,7 @@ func CertificateMatchesPrivateKey(cert *x509.Certificate, privateKey crypto.Priv
 		}
 
 	case *ecdsa.PrivateKey:
-		// Для ECDSA проверяем координаты точки на кривой
+		// Для ECDSA проверка координат точки на кривой
 		pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
 		if !ok {
 			return fmt.Errorf("публичный ключ в сертификате не ECDSA")
@@ -206,14 +244,21 @@ func CertificateMatchesPrivateKey(cert *x509.Certificate, privateKey crypto.Priv
 		}
 
 	default:
-		return fmt.Errorf("неподдерживаемый тип ключа")
+		return fmt.Errorf("неподдерживаемый тип ключа: %T", privateKey)
 	}
 
 	return nil
 }
 
 // GetCertificateInfo возвращает читаемую информацию о сертификате.
-// Полезно для отладки и вывода пользователю.
+// Полезна для отладки и вывода пользователю в командной строке.
+//
+// Возвращает многострочную строку с информацией о:
+//   - Субъекте и издателе
+//   - Серийном номере
+//   - Периоде действия
+//   - Алгоритме подписи
+//   - Расширениях (является ли CA, назначение ключа)
 func GetCertificateInfo(cert *x509.Certificate) string {
 	var info strings.Builder
 
@@ -243,13 +288,20 @@ func GetCertificateInfo(cert *x509.Certificate) string {
 }
 
 // GetKeyAlgorithm возвращает алгоритм и размер ключа.
-// Полезно для policy документа.
+// Полезна для документов политики и вывода информации пользователю.
+//
+// Поддерживает RSA и ECDSA ключи. Для ECDSA определяет размер по кривой.
+//
+// Возвращает:
+//   - algorithm: "RSA" или "ECC"
+//   - size: размер ключа в битах
+//   - error: если тип ключа не поддерживается
 func GetKeyAlgorithm(pubKey crypto.PublicKey) (string, int, error) {
 	switch key := pubKey.(type) {
 	case *rsa.PublicKey:
 		return "RSA", key.N.BitLen(), nil
 	case *ecdsa.PublicKey:
-		// Определяем размер ключа по кривой
+		// Определение размера ключа по используемой кривой
 		switch key.Curve {
 		case elliptic.P256():
 			return "ECC", 256, nil
@@ -266,24 +318,30 @@ func GetKeyAlgorithm(pubKey crypto.PublicKey) (string, int, error) {
 }
 
 // VerifySelfSigned проверяет самоподписанный сертификат.
-// Возвращает ошибку если проверка не пройдена.
+// Выполняет следующие проверки:
+//   - Издатель должен совпадать с субъектом
+//   - Подпись должна быть корректной (проверка самим собой)
+//   - Должен быть CA (IsCA=true)
+//   - Должен иметь правильные KeyUsage (keyCertSign и cRLSign)
+//
+// Возвращает ошибку, если любая из проверок не пройдена.
 func VerifySelfSigned(cert *x509.Certificate) error {
 	// Для самоподписанного сертификата издатель должен совпадать с субъектом
 	if cert.Issuer.String() != cert.Subject.String() {
 		return fmt.Errorf("издатель не совпадает с субъектом для самоподписанного сертификата")
 	}
 
-	// Проверяем подпись
+	// Проверка подписи
 	if err := cert.CheckSignatureFrom(cert); err != nil {
 		return fmt.Errorf("проверка подписи не пройдена: %w", err)
 	}
 
-	// Проверяем обязательные расширения для CA
+	// Проверка обязательных расширений для CA
 	if !cert.IsCA {
 		return fmt.Errorf("сертификат CA должен иметь IsCA=true")
 	}
 
-	// Проверяем KeyUsage
+	// Проверка KeyUsage
 	requiredKeyUsage := x509.KeyUsageCertSign | x509.KeyUsageCRLSign
 	if cert.KeyUsage&requiredKeyUsage != requiredKeyUsage {
 		return fmt.Errorf("отсутствуют обязательные KeyUsage: keyCertSign и cRLSign")
@@ -292,14 +350,19 @@ func VerifySelfSigned(cert *x509.Certificate) error {
 	return nil
 }
 
-// VerifyCertificate проверяет сертификат относительно издателя
+// VerifyCertificate проверяет сертификат относительно издателя.
+// Выполняет:
+//   - Проверку подписи издателем
+//   - Проверку срока действия
+//
+// Возвращает ошибку, если любая из проверок не пройдена.
 func VerifyCertificate(cert *x509.Certificate, issuer *x509.Certificate) error {
-	// Проверяем подпись
+	// Проверка подписи
 	if err := cert.CheckSignatureFrom(issuer); err != nil {
 		return fmt.Errorf("проверка подписи не пройдена: %w", err)
 	}
 
-	// Проверяем срок действия
+	// Проверка срока действия
 	now := time.Now()
 	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
 		return fmt.Errorf("сертификат недействителен в текущее время")
@@ -308,32 +371,40 @@ func VerifyCertificate(cert *x509.Certificate, issuer *x509.Certificate) error {
 	return nil
 }
 
-// Добавь в конец файла internal/certs/certs.go:
-
-// LoadCertificate loads and parses a PEM-encoded certificate from file
+// LoadCertificate загружает и парсит PEM-сертификат из файла.
+// Ожидает файл в формате PEM с блоком типа "CERTIFICATE".
+//
+// Возвращает ошибку, если:
+//   - Файл не может быть прочитан
+//   - PEM-декодирование не удалось
+//   - Тип блока не CERTIFICATE
+//   - Парсинг сертификата не удался
 func LoadCertificate(path string) (*x509.Certificate, error) {
 	pemData, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read certificate file: %w", err)
+		return nil, fmt.Errorf("не удалось прочитать файл сертификата: %w", err)
 	}
 
 	block, _ := pem.Decode(pemData)
 	if block == nil {
-		return nil, fmt.Errorf("failed to decode PEM certificate")
+		return nil, fmt.Errorf("не удалось декодировать PEM сертификат")
 	}
 	if block.Type != "CERTIFICATE" {
-		return nil, fmt.Errorf("invalid PEM type: %s (expected CERTIFICATE)", block.Type)
+		return nil, fmt.Errorf("неверный тип PEM: %s (ожидался CERTIFICATE)", block.Type)
 	}
 
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+		return nil, fmt.Errorf("не удалось разобрать сертификат: %w", err)
 	}
 
 	return cert, nil
 }
 
-// SaveCertificate saves a DER-encoded certificate to PEM file
+// SaveCertificate сохраняет DER-сертификат в PEM-файл.
+// Создаёт файл с правами доступа 0644 (rw-r--r--).
+//
+// Возвращает ошибку, если запись в файл не удалась.
 func SaveCertificate(certDER []byte, path string) error {
 	certPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",

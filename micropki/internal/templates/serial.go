@@ -1,3 +1,5 @@
+// Package templates содержит вспомогательные типы для работы с шаблонами сертификатов.
+// Этот файл определяет тип SerialNumber для работы с серийными номерами X.509 сертификатов.
 package templates
 
 import (
@@ -6,21 +8,33 @@ import (
 	"math/big"
 )
 
-// SerialNumber wraps big.Int for serial number operations
+// SerialNumber оборачивает big.Int для операций с серийными номерами сертификатов.
+// Предоставляет удобные методы для генерации и форматирования серийных номеров
+// в соответствии с требованиями X.509 и PKI.
 type SerialNumber struct {
+	// int - внутреннее представление серийного номера
 	int *big.Int
 }
 
-// NewSerialNumber generates a new cryptographically secure serial number
-// Implements PKI-2: minimum 20 bits of entropy (we use 160 bits)
+// NewSerialNumber генерирует новый криптографически безопасный серийный номер.
+// Реализует требование PKI-2: минимум 20 бит энтропии (используется 160 бит).
+//
+// Процесс генерации:
+//  1. Генерация 20 байт (160 бит) криптостойких случайных данных
+//  2. Сброс старшего бита для гарантии положительного числа (X.509 требование)
+//  3. Преобразование в *big.Int
+//
+// Возвращает:
+//   - *SerialNumber: новый серийный номер
+//   - error: ошибку, если генератор случайных чисел недоступен
 func NewSerialNumber() (*SerialNumber, error) {
-	// Generate 20 bytes (160 bits) of random data
+	// Генерация 20 байт (160 бит) случайных данных
 	bytes := make([]byte, 20)
 	if _, err := rand.Read(bytes); err != nil {
-		return nil, fmt.Errorf("failed to generate serial number: %w", err)
+		return nil, fmt.Errorf("не удалось сгенерировать серийный номер: %w", err)
 	}
 
-	// Ensure positive number by clearing the most significant bit
+	// Обеспечение положительного числа сбросом старшего бита
 	bytes[0] &= 0x7F
 
 	return &SerialNumber{
@@ -28,17 +42,21 @@ func NewSerialNumber() (*SerialNumber, error) {
 	}, nil
 }
 
-// BigInt returns the underlying big.Int
+// BigInt возвращает внутреннее представление серийного номера как *big.Int.
+// Используется при создании шаблонов сертификатов.
 func (s *SerialNumber) BigInt() *big.Int {
 	return s.int
 }
 
-// Hex returns hexadecimal representation
+// Hex возвращает шестнадцатеричное представление серийного номера.
+// Формат: заглавные буквы, без префикса "0x".
+// Пример: "1A2B3C4D5E6F..."
 func (s *SerialNumber) Hex() string {
 	return fmt.Sprintf("%X", s.int)
 }
 
-// String returns decimal representation
+// String возвращает десятичное представление серийного номера.
+// Реализует интерфейс fmt.Stringer.
 func (s *SerialNumber) String() string {
 	return s.int.String()
 }

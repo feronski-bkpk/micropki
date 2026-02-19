@@ -1,4 +1,12 @@
-// Package chain tests
+// Package chain_test содержит тесты для проверки цепочек сертификатов.
+// Тесты проверяют:
+//   - Создание валидных цепочек (корневой CA → промежуточный CA → конечный сертификат)
+//   - Успешную проверку корректных цепочек
+//   - Обнаружение ошибок в некорректных цепочках
+//   - Проверку подписей на всех уровнях
+//   - Проверку ограничений (CA флаги, сроки действия)
+//
+// Все тесты используют генерацию тестовых сертификатов для изоляции от внешних зависимостей.
 package chain
 
 import (
@@ -11,14 +19,27 @@ import (
 	"time"
 )
 
+// generateTestCert создаёт тестовый сертификат для использования в тестах.
+// Позволяет создавать как самоподписанные сертификаты, так и подписанные указанным издателем.
+//
+// Параметры:
+//   - isCA: флаг, указывающий, является ли сертификат центром сертификации
+//   - commonName: общее имя (CN) субъекта
+//   - signingKey: закрытый ключ издателя (nil для самоподписанного)
+//   - signingCert: сертификат издателя (nil для самоподписанного)
+//
+// Возвращает:
+//   - *x509.Certificate: созданный сертификат
+//   - *rsa.PrivateKey: закрытый ключ сертификата
+//   - error: ошибку, если создание не удалось
 func generateTestCert(isCA bool, commonName string, signingKey *rsa.PrivateKey, signingCert *x509.Certificate) (*x509.Certificate, *rsa.PrivateKey, error) {
-	// Generate key pair
+	// Генерация ключевой пары
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Create template
+	// Создание шаблона
 	serialNumber := big.NewInt(1)
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
@@ -44,12 +65,12 @@ func generateTestCert(isCA bool, commonName string, signingKey *rsa.PrivateKey, 
 		issuerCert = signingCert
 		issuerKey = signingKey
 	} else {
-		// Self-signed
+		// Самоподписанный сертификат
 		issuerCert = template
 		issuerKey = key
 	}
 
-	// Create certificate
+	// Создание сертификата
 	certDER, err := x509.CreateCertificate(rand.Reader, template, issuerCert, &key.PublicKey, issuerKey)
 	if err != nil {
 		return nil, nil, err
@@ -59,65 +80,78 @@ func generateTestCert(isCA bool, commonName string, signingKey *rsa.PrivateKey, 
 	return cert, key, err
 }
 
+// TestChainVerification проверяет успешную валидацию корректной цепочки.
+// Создаёт:
+//  1. Корневой CA (самоподписанный)
+//  2. Промежуточный CA (подписанный корневым)
+//  3. Конечный сертификат (подписанный промежуточным)
+//
+// Ожидает, что проверка цепочки завершится без ошибок.
 func TestChainVerification(t *testing.T) {
-	// Generate Root CA
+	// Генерация корневого CA
 	rootCert, rootKey, err := generateTestCert(true, "Test Root CA", nil, nil)
 	if err != nil {
-		t.Fatalf("Failed to generate root CA: %v", err)
+		t.Fatalf("Не удалось сгенерировать корневой CA: %v", err)
 	}
 
-	// Generate Intermediate CA signed by Root
+	// Генерация промежуточного CA, подписанного корневым
 	intermediateCert, intermediateKey, err := generateTestCert(true, "Test Intermediate CA", rootKey, rootCert)
 	if err != nil {
-		t.Fatalf("Failed to generate intermediate CA: %v", err)
+		t.Fatalf("Не удалось сгенерировать промежуточный CA: %v", err)
 	}
 
-	// Generate Leaf certificate signed by Intermediate
+	// Генерация конечного сертификата, подписанного промежуточным
 	leafCert, _, err := generateTestCert(false, "test.example.com", intermediateKey, intermediateCert)
 	if err != nil {
-		t.Fatalf("Failed to generate leaf cert: %v", err)
+		t.Fatalf("Не удалось сгенерировать конечный сертификат: %v", err)
 	}
 
-	// Create chain
+	// Создание цепочки
 	chain := &Chain{
 		Leaf:         leafCert,
 		Intermediate: intermediateCert,
 		Root:         rootCert,
 	}
 
-	// Verify chain
+	// Проверка цепочки
 	if err := chain.Verify(); err != nil {
-		t.Errorf("Chain verification failed: %v", err)
+		t.Errorf("Проверка цепочки не пройдена: %v", err)
 	}
 }
 
+// TestInvalidChain проверяет, что некорректная цепочка обнаруживается.
+// Создаёт два независимых CA и пытается построить цепочку с несоответствующим
+// корневым сертификатом.
+//
+// Ожидает, что проверка цепочки завершится с ошибкой.
 func TestInvalidChain(t *testing.T) {
-	// Generate two independent CAs
+	// Генерация двух независимых CA
 	root1Cert, _, err := generateTestCert(true, "Test Root CA 1", nil, nil)
 	if err != nil {
-		t.Fatalf("Failed to generate root CA 1: %v", err)
+		t.Fatalf("Не удалось сгенерировать корневой CA 1: %v", err)
 	}
 
 	root2Cert, root2Key, err := generateTestCert(true, "Test Root CA 2", nil, nil)
 	if err != nil {
-		t.Fatalf("Failed to generate root CA 2: %v", err)
+		t.Fatalf("Не удалось сгенерировать корневой CA 2: %v", err)
 	}
 
-	// Generate leaf signed by root2
+	// Генерация конечного сертификата, подписанного root2
 	leafCert, _, err := generateTestCert(false, "test.example.com", root2Key, root2Cert)
 	if err != nil {
-		t.Fatalf("Failed to generate leaf cert: %v", err)
+		t.Fatalf("Не удалось сгенерировать конечный сертификат: %v", err)
 	}
 
-	// Create mismatched chain (leaf signed by root2, but root1 as root)
+	// Создание несоответствующей цепочки (конечный сертификат подписан root2,
+	// но корневым указан root1)
 	chain := &Chain{
 		Leaf:         leafCert,
-		Intermediate: root2Cert, // Using root2 as intermediate
+		Intermediate: root2Cert, // Использование root2 как промежуточного
 		Root:         root1Cert,
 	}
 
-	// Verification should fail
+	// Проверка должна завершиться ошибкой
 	if err := chain.Verify(); err == nil {
-		t.Error("Expected chain verification to fail, but it succeeded")
+		t.Error("Ожидалась ошибка проверки цепочки, но проверка прошла успешно")
 	}
 }
