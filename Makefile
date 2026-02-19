@@ -82,7 +82,6 @@ clean:
 test:
 	@echo "${BOLD}${BLUE}→ Running tests...${RESET}"
 	@go test ./... -count=1 | grep -v "no test files"
-	@echo "${GREEN}✓ Tests passed${RESET}"
 
 ## test-verbose: запускает тесты с подробным выводом
 test-verbose:

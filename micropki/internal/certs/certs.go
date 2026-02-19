@@ -10,8 +10,10 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"math/big"
+	"os"
 	"strings"
 	"time"
 )
@@ -288,4 +290,55 @@ func VerifySelfSigned(cert *x509.Certificate) error {
 	}
 
 	return nil
+}
+
+// VerifyCertificate проверяет сертификат относительно издателя
+func VerifyCertificate(cert *x509.Certificate, issuer *x509.Certificate) error {
+	// Проверяем подпись
+	if err := cert.CheckSignatureFrom(issuer); err != nil {
+		return fmt.Errorf("проверка подписи не пройдена: %w", err)
+	}
+
+	// Проверяем срок действия
+	now := time.Now()
+	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+		return fmt.Errorf("сертификат недействителен в текущее время")
+	}
+
+	return nil
+}
+
+// Добавь в конец файла internal/certs/certs.go:
+
+// LoadCertificate loads and parses a PEM-encoded certificate from file
+func LoadCertificate(path string) (*x509.Certificate, error) {
+	pemData, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read certificate file: %w", err)
+	}
+
+	block, _ := pem.Decode(pemData)
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode PEM certificate")
+	}
+	if block.Type != "CERTIFICATE" {
+		return nil, fmt.Errorf("invalid PEM type: %s (expected CERTIFICATE)", block.Type)
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	return cert, nil
+}
+
+// SaveCertificate saves a DER-encoded certificate to PEM file
+func SaveCertificate(certDER []byte, path string) error {
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certDER,
+	})
+
+	return os.WriteFile(path, certPEM, 0644)
 }

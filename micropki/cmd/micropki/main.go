@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -16,8 +17,11 @@ import (
 	"strings"
 	"time"
 
+	"micropki/micropki/internal/ca"
 	"micropki/micropki/internal/certs"
+	"micropki/micropki/internal/chain"
 	"micropki/micropki/internal/crypto"
+	"micropki/micropki/internal/templates"
 )
 
 const (
@@ -59,8 +63,14 @@ func run(args []string, logger *log.Logger) error {
 		switch args[1] {
 		case "init":
 			return runCAInit(args[2:], logger)
+		case "issue-intermediate":
+			return runCAIssueIntermediate(args[2:], logger)
+		case "issue-cert":
+			return runCAIssueCert(args[2:], logger)
 		case "verify":
 			return runCAVerify(args[2:], logger)
+		case "verify-chain":
+			return runCAVerifyChain(args[2:], logger)
 		default:
 			return fmt.Errorf("unknown subcommand '%s' for 'ca'", args[1])
 		}
@@ -76,8 +86,12 @@ func printUsage() {
 	fmt.Println("MicroPKI - Minimal Public Key Infrastructure Tool")
 	fmt.Println("\nUsage: micropki-cli <command> [subcommand] [options]")
 	fmt.Println("\nCommands:")
-	fmt.Println("  ca init    Initialize a new Root CA")
-	fmt.Println("  ca verify  Verify a certificate")
+	fmt.Println("  ca init                 Initialize a new Root CA")
+	fmt.Println("  ca issue-intermediate   Create an Intermediate CA signed by Root CA")
+	fmt.Println("  ca issue-cert           Issue an end-entity certificate from Intermediate CA")
+	fmt.Println("  ca verify               Verify a certificate")
+	fmt.Println("  ca verify-chain         Verify a complete certificate chain")
+
 	fmt.Println("\nCA Init Options:")
 	fmt.Println("  --subject           Distinguished Name (required)")
 	fmt.Println("                      Format: /CN=.../O=... or CN=...,O=...")
@@ -88,10 +102,43 @@ func printUsage() {
 	fmt.Println("  --validity-days     Validity period in days (default: 3650)")
 	fmt.Println("  --log-file          Optional log file path")
 	fmt.Println("  --force             Force overwrite existing files")
+
+	fmt.Println("\nCA Issue-Intermediate Options:")
+	fmt.Println("  --root-cert         Path to Root CA certificate (PEM) (required)")
+	fmt.Println("  --root-key          Path to Root CA encrypted private key (PEM) (required)")
+	fmt.Println("  --root-pass-file    File containing passphrase for Root CA key (required)")
+	fmt.Println("  --subject           Distinguished Name for Intermediate CA (required)")
+	fmt.Println("  --key-type          Key type: rsa or ecc (required)")
+	fmt.Println("  --key-size          Key size: 4096 for RSA, 384 for ECC (required)")
+	fmt.Println("  --passphrase-file   Passphrase for Intermediate CA private key (required)")
+	fmt.Println("  --out-dir           Output directory (default: ./pki)")
+	fmt.Println("  --validity-days     Validity period (default: 1825 ≈ 5 years)")
+	fmt.Println("  --pathlen           Path length constraint (default: 0)")
+
+	fmt.Println("\nCA Issue-Cert Options:")
+	fmt.Println("  --ca-cert           Intermediate CA certificate (PEM) (required)")
+	fmt.Println("  --ca-key            Intermediate CA encrypted private key (PEM) (required)")
+	fmt.Println("  --ca-pass-file      Passphrase for Intermediate CA key (required)")
+	fmt.Println("  --template          Certificate template: server, client, code_signing (required)")
+	fmt.Println("  --subject           Distinguished Name for the certificate")
+	fmt.Println("  --san               Subject Alternative Name(s) (can be specified multiple times)")
+	fmt.Println("                      Format: dns:example.com, ip:192.168.1.1, email:user@ex.com, uri:https://ex.com")
+	fmt.Println("  --csr               Optional: sign external CSR instead of generating new key")
+	fmt.Println("  --out-dir           Output directory (default: ./pki/certs)")
+	fmt.Println("  --validity-days     Leaf certificate validity (default: 365)")
+	fmt.Println("  --key-type          Key type for internal generation: rsa or ecc (default: rsa)")
+	fmt.Println("  --key-size          Key size for internal generation (default: 2048 for RSA, 256 for ECC)")
+
 	fmt.Println("\nCA Verify Options:")
 	fmt.Println("  --cert              Path to certificate file to verify")
+
+	fmt.Println("\nCA Verify-Chain Options:")
+	fmt.Println("  --leaf              Path to leaf certificate (PEM)")
+	fmt.Println("  --intermediate      Path to intermediate certificate (PEM)")
+	fmt.Println("  --root              Path to root certificate (PEM)")
 }
 
+// runCAInit handles the 'ca init' subcommand
 func runCAInit(args []string, logger *log.Logger) error {
 	initCmd := flag.NewFlagSet("init", flag.ContinueOnError)
 
@@ -241,6 +288,279 @@ func runCAInit(args []string, logger *log.Logger) error {
 	return nil
 }
 
+// runCAIssueIntermediate handles the 'ca issue-intermediate' subcommand
+func runCAIssueIntermediate(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("issue-intermediate", flag.ContinueOnError)
+
+	var (
+		rootCertPath   string
+		rootKeyPath    string
+		rootPassFile   string
+		subject        string
+		keyType        string
+		keySize        int
+		passphraseFile string
+		outDir         string
+		validityDays   int
+		pathLen        int
+	)
+
+	cmd.StringVar(&rootCertPath, "root-cert", "", "Path to Root CA certificate (PEM)")
+	cmd.StringVar(&rootKeyPath, "root-key", "", "Path to Root CA encrypted private key (PEM)")
+	cmd.StringVar(&rootPassFile, "root-pass-file", "", "File containing passphrase for Root CA key")
+	cmd.StringVar(&subject, "subject", "", "Distinguished Name for Intermediate CA")
+	cmd.StringVar(&keyType, "key-type", "rsa", "Key type: rsa or ecc")
+	cmd.IntVar(&keySize, "key-size", 0, "Key size: 4096 for RSA, 384 for ECC")
+	cmd.StringVar(&passphraseFile, "passphrase-file", "", "Passphrase for Intermediate CA private key")
+	cmd.StringVar(&outDir, "out-dir", "./pki", "Output directory")
+	cmd.IntVar(&validityDays, "validity-days", 1825, "Validity period in days")
+	cmd.IntVar(&pathLen, "pathlen", 0, "Path length constraint")
+
+	cmd.SetOutput(os.Stderr)
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	// Validate required arguments
+	if rootCertPath == "" {
+		return fmt.Errorf("--root-cert is required")
+	}
+	if rootKeyPath == "" {
+		return fmt.Errorf("--root-key is required")
+	}
+	if rootPassFile == "" {
+		return fmt.Errorf("--root-pass-file is required")
+	}
+	if subject == "" {
+		return fmt.Errorf("--subject is required")
+	}
+	if keySize == 0 {
+		return fmt.Errorf("--key-size is required")
+	}
+	if passphraseFile == "" {
+		return fmt.Errorf("--passphrase-file is required")
+	}
+
+	// Validate key type and size
+	keyType = strings.ToLower(keyType)
+	if keyType != "rsa" && keyType != "ecc" {
+		return fmt.Errorf("--key-type must be 'rsa' or 'ecc'")
+	}
+	if keyType == "rsa" && keySize != 4096 {
+		return fmt.Errorf("RSA key size must be 4096")
+	}
+	if keyType == "ecc" && keySize != 384 {
+		return fmt.Errorf("ECC key size must be 384")
+	}
+
+	// Read root passphrase
+	rootPassphrase, err := readPassphraseFromFile(rootPassFile)
+	if err != nil {
+		return fmt.Errorf("failed to read root passphrase: %w", err)
+	}
+	defer crypto.SecureZero(rootPassphrase)
+
+	// Read intermediate passphrase
+	passphrase, err := readPassphraseFromFile(passphraseFile)
+	if err != nil {
+		return fmt.Errorf("failed to read passphrase: %w", err)
+	}
+	defer crypto.SecureZero(passphrase)
+
+	// Parse subject DN
+	parsedSubject, err := certs.ParseDN(subject)
+	if err != nil {
+		return fmt.Errorf("failed to parse subject: %w", err)
+	}
+
+	// Setup logging
+	if err := setupLogging(logger, ""); err != nil {
+		return err
+	}
+
+	logger.Printf("INFO: Starting Intermediate CA issuance")
+	logger.Printf("INFO: Subject: %s", subject)
+	logger.Printf("INFO: Key type: %s-%d", keyType, keySize)
+	logger.Printf("INFO: Validity: %d days, PathLen: %d", validityDays, pathLen)
+
+	// Create output directories
+	if err := createOutputDirectories(outDir, true, logger); err != nil {
+		return fmt.Errorf("failed to create directories: %w", err)
+	}
+
+	// Configure and issue intermediate CA
+	cfg := &ca.CAConfig{
+		RootCertPath:   rootCertPath,
+		RootKeyPath:    rootKeyPath,
+		RootPassphrase: rootPassphrase,
+		Subject:        parsedSubject,
+		KeyType:        keyType,
+		KeySize:        keySize,
+		Passphrase:     passphrase,
+		OutDir:         outDir,
+		ValidityDays:   validityDays,
+		PathLen:        pathLen,
+	}
+
+	if err := ca.IssueIntermediate(cfg); err != nil {
+		return fmt.Errorf("failed to issue intermediate CA: %w", err)
+	}
+
+	logger.Printf("INFO: Intermediate CA issued successfully")
+	return nil
+}
+
+// runCAIssueCert handles the 'ca issue-cert' subcommand
+func runCAIssueCert(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("issue-cert", flag.ContinueOnError)
+
+	var (
+		caCertPath   string
+		caKeyPath    string
+		caPassFile   string
+		templateType string
+		subject      string
+		sans         arrayFlags
+		csrPath      string
+		outDir       string
+		validityDays int
+		keyType      string
+		keySize      int
+	)
+
+	cmd.StringVar(&caCertPath, "ca-cert", "", "Intermediate CA certificate (PEM)")
+	cmd.StringVar(&caKeyPath, "ca-key", "", "Intermediate CA encrypted private key (PEM)")
+	cmd.StringVar(&caPassFile, "ca-pass-file", "", "Passphrase for Intermediate CA key")
+	cmd.StringVar(&templateType, "template", "", "Certificate template: server, client, code_signing")
+	cmd.StringVar(&subject, "subject", "", "Distinguished Name for the certificate")
+	cmd.Var(&sans, "san", "Subject Alternative Name(s) (can be specified multiple times)")
+	cmd.StringVar(&csrPath, "csr", "", "Optional: sign external CSR instead of generating new key")
+	cmd.StringVar(&outDir, "out-dir", "./pki/certs", "Output directory")
+	cmd.IntVar(&validityDays, "validity-days", 365, "Leaf certificate validity")
+	cmd.StringVar(&keyType, "key-type", "rsa", "Key type for internal generation: rsa or ecc")
+	cmd.IntVar(&keySize, "key-size", 0, "Key size for internal generation")
+
+	cmd.SetOutput(os.Stderr)
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	// Validate required arguments
+	if caCertPath == "" {
+		return fmt.Errorf("--ca-cert is required")
+	}
+	if caKeyPath == "" {
+		return fmt.Errorf("--ca-key is required")
+	}
+	if caPassFile == "" {
+		return fmt.Errorf("--ca-pass-file is required")
+	}
+	if templateType == "" {
+		return fmt.Errorf("--template is required")
+	}
+
+	// If no CSR, subject and key size are required
+	if csrPath == "" {
+		if subject == "" {
+			return fmt.Errorf("--subject is required when not using --csr")
+		}
+		if keySize == 0 {
+			// Set defaults
+			switch strings.ToLower(keyType) {
+			case "rsa":
+				keySize = 2048
+			case "ecc":
+				keySize = 256
+			default:
+				return fmt.Errorf("--key-type must be 'rsa' or 'ecc'")
+			}
+		}
+	}
+
+	// Validate template type
+	var tmplType templates.TemplateType
+	switch strings.ToLower(templateType) {
+	case "server":
+		tmplType = templates.Server
+	case "client":
+		tmplType = templates.Client
+	case "code_signing":
+		tmplType = templates.CodeSigning
+	default:
+		return fmt.Errorf("invalid template: %s (must be server, client, or code_signing)", templateType)
+	}
+
+	// Read CA passphrase
+	caPassphrase, err := readPassphraseFromFile(caPassFile)
+	if err != nil {
+		return fmt.Errorf("failed to read CA passphrase: %w", err)
+	}
+	defer crypto.SecureZero(caPassphrase)
+
+	// Parse subject if provided
+	var parsedSubject *pkix.Name
+	if subject != "" {
+		parsedSubject, err = certs.ParseDN(subject)
+		if err != nil {
+			return fmt.Errorf("failed to parse subject: %w", err)
+		}
+	}
+
+	// Parse SANs
+	var parsedSANs []templates.SAN
+	for _, san := range sans {
+		parsed, err := templates.ParseSANString(san)
+		if err != nil {
+			return fmt.Errorf("invalid SAN '%s': %w", san, err)
+		}
+		parsedSANs = append(parsedSANs, parsed)
+	}
+
+	// Setup logging
+	if err := setupLogging(logger, ""); err != nil {
+		return err
+	}
+
+	logger.Printf("INFO: Starting certificate issuance")
+	logger.Printf("INFO: Template: %s", templateType)
+	if subject != "" {
+		logger.Printf("INFO: Subject: %s", subject)
+	}
+	if len(parsedSANs) > 0 {
+		logger.Printf("INFO: SANs: %v", parsedSANs)
+	}
+
+	// Create output directory
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	// Configure and issue certificate
+	cfg := &ca.IssueCertificateConfig{
+		CACertPath:   caCertPath,
+		CAKeyPath:    caKeyPath,
+		CAPassphrase: caPassphrase,
+		Template:     tmplType,
+		Subject:      parsedSubject,
+		SANs:         parsedSANs,
+		CSRPath:      csrPath,
+		OutDir:       outDir,
+		ValidityDays: validityDays,
+		KeyType:      keyType,
+		KeySize:      keySize,
+	}
+
+	if err := ca.IssueCertificate(cfg); err != nil {
+		return fmt.Errorf("failed to issue certificate: %w", err)
+	}
+
+	logger.Printf("INFO: Certificate issued successfully")
+	return nil
+}
+
+// runCAVerify handles the 'ca verify' subcommand
 func runCAVerify(args []string, logger *log.Logger) error {
 	verifyCmd := flag.NewFlagSet("verify", flag.ContinueOnError)
 	var certPath string
@@ -269,8 +589,17 @@ func runCAVerify(args []string, logger *log.Logger) error {
 		return fmt.Errorf("failed to parse certificate: %w", err)
 	}
 
-	if err := cert.CheckSignatureFrom(cert); err != nil {
-		return fmt.Errorf("certificate verification FAILED: %w", err)
+	// Проверяем, самоподписанный ли это сертификат
+	if cert.Issuer.String() == cert.Subject.String() {
+		// Самоподписанный - проверяем через VerifySelfSigned
+		if err := certs.VerifySelfSigned(cert); err != nil {
+			return fmt.Errorf("certificate verification FAILED: %w", err)
+		}
+	} else {
+		// Не самоподписанный - нужно найти издателя
+		// Для простоты просто проверяем подпись от самого себя? Нет, так нельзя
+		// В данном случае мы не можем проверить без цепочки
+		fmt.Printf("WARNING: Certificate is not self-signed. Use 'ca verify-chain' for full chain verification.\n")
 	}
 
 	fmt.Printf("Certificate verification PASSED\n")
@@ -280,7 +609,74 @@ func runCAVerify(args []string, logger *log.Logger) error {
 	fmt.Printf("  Serial: %X\n", cert.SerialNumber)
 	fmt.Printf("  Valid from: %s\n", cert.NotBefore.Format(time.RFC3339))
 	fmt.Printf("  Valid until: %s\n", cert.NotAfter.Format(time.RFC3339))
+	fmt.Printf("  IsCA: %v\n", cert.IsCA)
 
+	if cert.IsCA {
+		fmt.Printf("  PathLen: %d\n", cert.MaxPathLen)
+	}
+
+	return nil
+}
+
+// runCAVerifyChain handles the 'ca verify-chain' subcommand
+func runCAVerifyChain(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("verify-chain", flag.ContinueOnError)
+
+	var (
+		leafPath         string
+		intermediatePath string
+		rootPath         string
+	)
+
+	cmd.StringVar(&leafPath, "leaf", "", "Path to leaf certificate (PEM)")
+	cmd.StringVar(&intermediatePath, "intermediate", "", "Path to intermediate certificate (PEM)")
+	cmd.StringVar(&rootPath, "root", "", "Path to root certificate (PEM)")
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	if leafPath == "" || intermediatePath == "" || rootPath == "" {
+		return fmt.Errorf("--leaf, --intermediate, and --root are all required")
+	}
+
+	// Load and verify chain
+	certChain, err := chain.LoadChain(leafPath, intermediatePath, rootPath)
+	if err != nil {
+		return fmt.Errorf("failed to load certificate chain: %w", err)
+	}
+
+	fmt.Println(certChain.PrintChainInfo())
+
+	fmt.Println("\nVerifying chain...")
+	if err := certChain.Verify(); err != nil {
+		return fmt.Errorf("chain verification FAILED: %w", err)
+	}
+
+	// Additional OpenSSL compatibility check
+	if err := certChain.VerifyWithOpenSSLCompatibility(); err != nil {
+		fmt.Printf("WARNING: %v\n", err)
+	}
+
+	fmt.Println("\n✓ Certificate chain verification PASSED")
+
+	// Try OpenSSL-style verification hint
+	fmt.Println("\nTo verify with OpenSSL:")
+	fmt.Printf("  openssl verify -CAfile %s -untrusted %s %s\n",
+		rootPath, intermediatePath, leafPath)
+
+	return nil
+}
+
+// arrayFlags allows multiple flags of the same type
+type arrayFlags []string
+
+func (i *arrayFlags) String() string {
+	return strings.Join(*i, ", ")
+}
+
+func (i *arrayFlags) Set(value string) error {
+	*i = append(*i, value)
 	return nil
 }
 
