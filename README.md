@@ -116,7 +116,7 @@ echo "MyIntermediatePass456" > intermediate-pass.txt
 
 ```bash
 # Требования: Go 1.21 или выше
-git clone https://github.com/yourusername/micropki.git
+git clone https://github.com/feronski-bkpk/micropki
 cd micropki
 make build
 sudo make install  # опционально, установит в /usr/local/bin
