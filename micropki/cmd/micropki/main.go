@@ -9,21 +9,29 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"micropki/micropki/internal/ca"
 	"micropki/micropki/internal/certs"
 	"micropki/micropki/internal/chain"
+	"micropki/micropki/internal/config"
 	"micropki/micropki/internal/crypto"
+	"micropki/micropki/internal/database"
+	"micropki/micropki/internal/repository"
+	"micropki/micropki/internal/serial"
 	"micropki/micropki/internal/templates"
 )
 
@@ -92,8 +100,34 @@ func run(args []string, logger *log.Logger) error {
 			return runCAVerify(args[2:], logger)
 		case "verify-chain":
 			return runCAVerifyChain(args[2:], logger)
+		case "list-certs":
+			return runCAListCerts(args[2:], logger)
+		case "show-cert":
+			return runCAShowCert(args[2:], logger)
 		default:
 			return fmt.Errorf("неизвестная подкоманда '%s' для 'ca'", args[1])
+		}
+	case "db":
+		if len(args) < 2 {
+			return fmt.Errorf("отсутствует подкоманда для 'db'\nИспользование: micropki-cli db <подкоманда> [опции]")
+		}
+		switch args[1] {
+		case "init":
+			return runDBInit(args[2:], logger)
+		default:
+			return fmt.Errorf("неизвестная подкоманда '%s' для 'db'", args[1])
+		}
+	case "repo":
+		if len(args) < 2 {
+			return fmt.Errorf("отсутствует подкоманда для 'repo'\nИспользование: micropki-cli repo <подкоманда> [опции]")
+		}
+		switch args[1] {
+		case "serve":
+			return runRepoServe(args[2:], logger)
+		case "status":
+			return runRepoStatus(args[2:], logger)
+		default:
+			return fmt.Errorf("неизвестная подкоманда '%s' для 'repo'", args[1])
 		}
 	case "help", "--help", "-h":
 		printUsage()
@@ -106,14 +140,27 @@ func run(args []string, logger *log.Logger) error {
 // printUsage выводит подробную справку по использованию программы,
 // включая все доступные команды, подкоманды и их опции.
 func printUsage() {
-	fmt.Println("MicroPKI - Минимальная инфраструктура открытых ключей")
+	fmt.Println("MicroPKI - Минимальная инфраструктура открытых ключей (Спринт 3)")
 	fmt.Println("\nИспользование: micropki-cli <команда> [подкоманда] [опции]")
-	fmt.Println("\nКоманды:")
+
+	fmt.Println("\nКоманды CA (центры сертификации):")
 	fmt.Println("  ca init                 Инициализация нового корневого CA")
 	fmt.Println("  ca issue-intermediate   Создание промежуточного CA, подписанного корневым CA")
 	fmt.Println("  ca issue-cert           Выпуск конечного сертификата от промежуточного CA")
 	fmt.Println("  ca verify               Проверка сертификата")
 	fmt.Println("  ca verify-chain         Проверка полной цепочки сертификатов")
+	fmt.Println("  ca list-certs           Список всех сертификатов в базе данных")
+	fmt.Println("  ca show-cert <serial>   Показать сертификат по серийному номеру")
+
+	fmt.Println("\nКоманды Базы данных:")
+	fmt.Println("  db init                 Инициализация базы данных SQLite")
+
+	fmt.Println("\nКоманды Репозитория (HTTP сервер):")
+	fmt.Println("  repo serve              Запуск HTTP сервера репозитория")
+	fmt.Println("  repo status             Проверка статуса сервера репозитория")
+
+	fmt.Println("\nОбщие команды:")
+	fmt.Println("  help                    Показать эту справку")
 
 	fmt.Println("\nОпции для CA Init:")
 	fmt.Println("  --subject           Различающееся имя (обязательно)")
@@ -137,6 +184,7 @@ func printUsage() {
 	fmt.Println("  --out-dir           Выходная директория (по умолчанию: ./pki)")
 	fmt.Println("  --validity-days     Срок действия (по умолчанию: 1825 ≈ 5 лет)")
 	fmt.Println("  --pathlen           Ограничение длины пути (по умолчанию: 0)")
+	fmt.Println("  --db-path           Путь к базе данных SQLite (для автоматической вставки)")
 
 	fmt.Println("\nОпции для CA Issue-Cert:")
 	fmt.Println("  --ca-cert           Сертификат промежуточного CA (PEM) (обязательно)")
@@ -151,28 +199,439 @@ func printUsage() {
 	fmt.Println("  --validity-days     Срок действия конечного сертификата (по умолчанию: 365)")
 	fmt.Println("  --key-type          Тип ключа для внутренней генерации: rsa или ecc (по умолчанию: rsa)")
 	fmt.Println("  --key-size          Размер ключа для внутренней генерации (по умолчанию: 2048 для RSA, 256 для ECC)")
+	fmt.Println("  --db-path           Путь к базе данных SQLite (для автоматической вставки)")
 
-	fmt.Println("\nОпции для CA Verify:")
-	fmt.Println("  --cert              Путь к файлу сертификата для проверки")
+	fmt.Println("\nОпции для CA List-Certs:")
+	fmt.Println("  --db-path           Путь к базе данных SQLite (по умолчанию: ./pki/micropki.db)")
+	fmt.Println("  --status            Фильтр по статусу: valid, revoked, expired")
+	fmt.Println("  --format            Формат вывода: table, json, csv (по умолчанию: table)")
 
-	fmt.Println("\nОпции для CA Verify-Chain:")
-	fmt.Println("  --leaf              Путь к конечному сертификату (PEM)")
-	fmt.Println("  --intermediate      Путь к промежуточному сертификату (PEM)")
-	fmt.Println("  --root              Путь к корневому сертификату (PEM)")
+	fmt.Println("\nОпции для CA Show-Cert:")
+	fmt.Println("  --db-path           Путь к базе данных SQLite (по умолчанию: ./pki/micropki.db)")
+	fmt.Println("  --format            Формат вывода: pem, text (по умолчанию: pem)")
+
+	fmt.Println("\nОпции для DB Init:")
+	fmt.Println("  --db-path           Путь к файлу базы данных SQLite (по умолчанию: ./pki/micropki.db)")
+	fmt.Println("  --force             Принудительная перезапись существующей БД")
+
+	fmt.Println("\nОпции для Repo Serve:")
+	fmt.Println("  --host              Адрес для прослушивания (по умолчанию: 127.0.0.1)")
+	fmt.Println("  --port              Порт (по умолчанию: 8080)")
+	fmt.Println("  --db-path           Путь к базе данных SQLite (по умолчанию: ./pki/micropki.db)")
+	fmt.Println("  --cert-dir          Директория с сертификатами CA (по умолчанию: ./pki/certs)")
+	fmt.Println("  --log-file          Файл для логов HTTP сервера")
+	fmt.Println("  --config            Путь к конфигурационному файлу (YAML/JSON)")
+
+	fmt.Println("\nОпции для Repo Status:")
+	fmt.Println("  --port              Порт для проверки (по умолчанию: 8080)")
 }
 
+// ============================================================================
+// Команды для работы с базой данных
+// ============================================================================
+
+// runDBInit обрабатывает подкоманду 'db init' для инициализации базы данных.
+func runDBInit(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("db-init", flag.ContinueOnError)
+
+	var (
+		dbPath string
+		force  bool
+	)
+
+	cmd.StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к базе данных SQLite")
+	cmd.BoolVar(&force, "force", false, "Принудительная перезапись существующей БД")
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	logger.Printf("INFO: Инициализация базы данных: %s", dbPath)
+
+	// Проверяем существование БД
+	if _, err := os.Stat(dbPath); err == nil && !force {
+		logger.Printf("INFO: База данных уже существует. Используйте --force для перезаписи")
+		return nil
+	}
+
+	// Создаем директорию, если нужно
+	dbDir := filepath.Dir(dbPath)
+	if dbDir != "." && dbDir != "" {
+		if err := os.MkdirAll(dbDir, 0700); err != nil {
+			return fmt.Errorf("не удалось создать директорию для БД: %w", err)
+		}
+	}
+
+	// Если force и файл существует, удаляем его
+	if force {
+		os.Remove(dbPath)
+	}
+
+	// Открываем и инициализируем БД
+	db, err := database.New(dbPath)
+	if err != nil {
+		return fmt.Errorf("не удалось подключиться к БД: %w", err)
+	}
+	defer db.Close()
+
+	if err := db.InitSchema(); err != nil {
+		return fmt.Errorf("не удалось инициализировать схему БД: %w", err)
+	}
+
+	logger.Printf("INFO: База данных успешно инициализирована")
+	fmt.Printf("\n✓ База данных инициализирована: %s\n", dbPath)
+
+	return nil
+}
+
+// ============================================================================
+// Новые команды CA для работы с БД
+// ============================================================================
+
+// runCAListCerts обрабатывает подкоманду 'ca list-certs'.
+func runCAListCerts(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("list-certs", flag.ContinueOnError)
+
+	var (
+		dbPath string
+		status string
+		format string
+	)
+
+	cmd.StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к базе данных SQLite")
+	cmd.StringVar(&status, "status", "", "Фильтр по статусу: valid, revoked, expired")
+	cmd.StringVar(&format, "format", "table", "Формат вывода: table, json, csv")
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	// Подключаемся к БД
+	db, err := database.New(dbPath)
+	if err != nil {
+		return fmt.Errorf("не удалось подключиться к БД: %w", err)
+	}
+	defer db.Close()
+
+	// Получаем список сертификатов
+	records, err := db.ListCertificates(status, "")
+	if err != nil {
+		return fmt.Errorf("не удалось получить список сертификатов: %w", err)
+	}
+
+	if len(records) == 0 {
+		fmt.Println("Сертификаты не найдены")
+		return nil
+	}
+
+	// Выводим в нужном формате
+	switch strings.ToLower(format) {
+	case "json":
+		return printCertsJSON(records)
+	case "csv":
+		return printCertsCSV(records)
+	case "table":
+		printCertsTable(records)
+	default:
+		return fmt.Errorf("неподдерживаемый формат: %s", format)
+	}
+
+	return nil
+}
+
+// runCAShowCert обрабатывает подкоманду 'ca show-cert'.
+func runCAShowCert(args []string, logger *log.Logger) error {
+	if len(args) < 1 {
+		return fmt.Errorf("требуется серийный номер\nИспользование: micropki-cli ca show-cert <serial> [опции]")
+	}
+
+	serialHex := args[0]
+
+	cmd := flag.NewFlagSet("show-cert", flag.ContinueOnError)
+
+	var (
+		dbPath string
+		format string
+	)
+
+	cmd.StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к базе данных SQLite")
+	cmd.StringVar(&format, "format", "pem", "Формат вывода: pem, text")
+
+	if err := cmd.Parse(args[1:]); err != nil {
+		return err
+	}
+
+	// Подключаемся к БД
+	db, err := database.New(dbPath)
+	if err != nil {
+		return fmt.Errorf("не удалось подключиться к БД: %w", err)
+	}
+	defer db.Close()
+
+	// Получаем сертификат
+	record, err := db.GetCertificateBySerial(serialHex)
+	if err != nil {
+		return fmt.Errorf("сертификат не найден: %w", err)
+	}
+
+	// Выводим в нужном формате
+	switch strings.ToLower(format) {
+	case "pem":
+		fmt.Print(record.CertPEM)
+	case "text":
+		printCertText(record)
+	default:
+		return fmt.Errorf("неподдерживаемый формат: %s", format)
+	}
+
+	return nil
+}
+
+// ============================================================================
+// Команды для репозитория
+// ============================================================================
+
+// runRepoServe обрабатывает подкоманду 'repo serve'.
+func runRepoServe(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("repo-serve", flag.ContinueOnError)
+
+	var (
+		host       string
+		port       int
+		dbPath     string
+		certDir    string
+		logFile    string
+		configPath string
+	)
+
+	cmd.StringVar(&host, "host", "127.0.0.1", "Адрес для прослушивания")
+	cmd.IntVar(&port, "port", 8080, "Порт")
+	cmd.StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к базе данных SQLite")
+	cmd.StringVar(&certDir, "cert-dir", "./pki/certs", "Директория с сертификатами CA")
+	cmd.StringVar(&logFile, "log-file", "", "Файл для логов HTTP сервера")
+	cmd.StringVar(&configPath, "config", "", "Путь к конфигурационному файлу")
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	// Загружаем конфигурацию, если указана
+	if configPath != "" {
+		cfg, err := config.Load(configPath)
+		if err != nil {
+			logger.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось загрузить конфигурацию: %v", err)
+		} else {
+			// Переопределяем параметры из конфига, если они не заданы в CLI
+			if host == "127.0.0.1" && cfg.Server.Host != "" {
+				host = cfg.Server.Host
+			}
+			if port == 8080 && cfg.Server.Port != 0 {
+				port = cfg.Server.Port
+			}
+			if dbPath == "./pki/micropki.db" && cfg.Database.Path != "" {
+				dbPath = cfg.Database.Path
+			}
+			if certDir == "./pki/certs" && cfg.Server.CertDir != "" {
+				certDir = cfg.Server.CertDir
+			}
+		}
+	}
+
+	// Создаем конфигурацию сервера
+	serverCfg := &repository.Config{
+		Host:    host,
+		Port:    port,
+		DBPath:  dbPath,
+		CertDir: certDir,
+		LogFile: logFile,
+	}
+
+	// Создаем сервер
+	server, err := repository.NewServer(serverCfg)
+	if err != nil {
+		return fmt.Errorf("не удалось создать сервер: %w", err)
+	}
+
+	// Обработка сигналов для graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		logger.Println("Получен сигнал завершения, останавливаем сервер...")
+		if err := server.Stop(); err != nil {
+			logger.Printf("Ошибка при остановке сервера: %v", err)
+		}
+	}()
+
+	// Запускаем сервер
+	logger.Printf("Запуск репозитория на %s:%d", host, port)
+	if err := server.Start(host, port); err != nil {
+		return fmt.Errorf("ошибка сервера: %w", err)
+	}
+
+	return nil
+}
+
+// runRepoStatus обрабатывает подкоманду 'repo status'.
+func runRepoStatus(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("repo-status", flag.ContinueOnError)
+
+	var port int
+
+	cmd.IntVar(&port, "port", 8080, "Порт для проверки")
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	// Проверяем доступность порта через HTTP запрос
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
+	if err == nil {
+		defer resp.Body.Close()
+		fmt.Printf("Сервер репозитория запущен на порту %d (статус: %s)\n", port, resp.Status)
+		fmt.Printf("Эндпоинты:\n")
+		fmt.Printf("  GET http://127.0.0.1:%d/health\n", port)
+		fmt.Printf("  GET http://127.0.0.1:%d/certificate/<serial>\n", port)
+		fmt.Printf("  GET http://127.0.0.1:%d/ca/root\n", port)
+		fmt.Printf("  GET http://127.0.0.1:%d/ca/intermediate\n", port)
+		fmt.Printf("  GET http://127.0.0.1:%d/crl\n", port)
+	} else {
+		fmt.Printf("Сервер репозитория не запущен на порту %d\n", port)
+	}
+
+	return nil
+}
+
+// ============================================================================
+// Вспомогательные функции для форматирования вывода
+// ============================================================================
+
+// printCertsTable выводит сертификаты в табличном формате.
+func printCertsTable(records []*database.CertificateRecord) {
+	fmt.Println("\nСертификаты в базе данных:")
+	fmt.Println(strings.Repeat("-", 100))
+	fmt.Printf("%-20s %-30s %-15s %-20s\n", "Серийный номер", "Субъект", "Статус", "Истекает")
+	fmt.Println(strings.Repeat("-", 100))
+
+	for _, r := range records {
+		// Обрезаем длинные значения
+		serial := r.SerialHex
+		if len(serial) > 16 {
+			serial = serial[:8] + "..." + serial[len(serial)-8:]
+		}
+
+		subject := r.Subject
+		if len(subject) > 27 {
+			subject = subject[:24] + "..."
+		}
+
+		expires := r.NotAfter.Format("2006-01-02")
+
+		fmt.Printf("%-20s %-30s %-15s %-20s\n", serial, subject, r.Status, expires)
+	}
+	fmt.Println(strings.Repeat("-", 100))
+	fmt.Printf("Всего: %d сертификатов\n", len(records))
+}
+
+// printCertsJSON выводит сертификаты в JSON формате.
+func printCertsJSON(records []*database.CertificateRecord) error {
+	// Создаем упрощенную структуру для вывода
+	type certInfo struct {
+		SerialHex string `json:"serial_hex"`
+		Subject   string `json:"subject"`
+		Issuer    string `json:"issuer"`
+		NotBefore string `json:"not_before"`
+		NotAfter  string `json:"not_after"`
+		Status    string `json:"status"`
+	}
+
+	var infos []certInfo
+	for _, r := range records {
+		infos = append(infos, certInfo{
+			SerialHex: r.SerialHex,
+			Subject:   r.Subject,
+			Issuer:    r.Issuer,
+			NotBefore: r.NotBefore.Format(time.RFC3339),
+			NotAfter:  r.NotAfter.Format(time.RFC3339),
+			Status:    r.Status,
+		})
+	}
+
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(infos)
+}
+
+// printCertsCSV выводит сертификаты в CSV формате.
+func printCertsCSV(records []*database.CertificateRecord) error {
+	fmt.Println("serial_hex,subject,issuer,not_before,not_after,status")
+	for _, r := range records {
+		fmt.Printf("%s,%s,%s,%s,%s,%s\n",
+			r.SerialHex,
+			escapeCSV(r.Subject),
+			escapeCSV(r.Issuer),
+			r.NotBefore.Format(time.RFC3339),
+			r.NotAfter.Format(time.RFC3339),
+			r.Status,
+		)
+	}
+	return nil
+}
+
+// escapeCSV экранирует специальные символы для CSV.
+func escapeCSV(s string) string {
+	if strings.ContainsAny(s, ",\"\n") {
+		s = strings.ReplaceAll(s, "\"", "\"\"")
+		return "\"" + s + "\""
+	}
+	return s
+}
+
+// printCertText выводит информацию о сертификате в читаемом формате.
+func printCertText(record *database.CertificateRecord) {
+	fmt.Println("\n=== Информация о сертификате ===")
+	fmt.Printf("Серийный номер (hex): %s\n", record.SerialHex)
+	fmt.Printf("Субъект: %s\n", record.Subject)
+	fmt.Printf("Издатель: %s\n", record.Issuer)
+	fmt.Printf("Действителен с: %s\n", record.NotBefore.Format(time.RFC3339))
+	fmt.Printf("Действителен до: %s\n", record.NotAfter.Format(time.RFC3339))
+	fmt.Printf("Статус: %s\n", record.Status)
+
+	if record.RevocationReason.Valid {
+		fmt.Printf("Причина отзыва: %s\n", record.RevocationReason.String)
+	}
+	if record.RevocationDate.Valid {
+		fmt.Printf("Дата отзыва: %s\n", record.RevocationDate.Time.Format(time.RFC3339))
+	}
+
+	// Парсим PEM для дополнительной информации
+	block, _ := pem.Decode([]byte(record.CertPEM))
+	if block != nil {
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err == nil {
+			fmt.Printf("\nРасширения X.509:\n")
+			fmt.Printf("  Версия: %d\n", cert.Version)
+			fmt.Printf("  Алгоритм подписи: %s\n", cert.SignatureAlgorithm)
+			fmt.Printf("  Является CA: %v\n", cert.IsCA)
+			if len(cert.DNSNames) > 0 {
+				fmt.Printf("  DNS имена: %v\n", cert.DNSNames)
+			}
+			if len(cert.IPAddresses) > 0 {
+				fmt.Printf("  IP адреса: %v\n", cert.IPAddresses)
+			}
+			if len(cert.EmailAddresses) > 0 {
+				fmt.Printf("  Email адреса: %v\n", cert.EmailAddresses)
+			}
+		}
+	}
+}
+
+// ============================================================================
+// Существующие функции (без изменений)
+// ============================================================================
+
 // runCAInit обрабатывает подкоманду 'ca init' для инициализации нового корневого CA.
-// Функция выполняет следующие шаги:
-// 1. Парсинг и валидация аргументов командной строки
-// 2. Чтение парольной фразы из файла
-// 3. Настройка логирования
-// 4. Создание выходных директорий
-// 5. Генерация ключевой пары
-// 6. Создание самоподписанного сертификата
-// 7. Сохранение зашифрованного закрытого ключа и сертификата
-// 8. Создание документа политики
-//
-// Возвращает ошибку, если какой-либо из шагов завершился неудачей.
 func runCAInit(args []string, logger *log.Logger) error {
 	initCmd := flag.NewFlagSet("init", flag.ContinueOnError)
 
@@ -259,7 +718,9 @@ func runCAInit(args []string, logger *log.Logger) error {
 		return fmt.Errorf("не удалось разобрать DN субъекта: %w", err)
 	}
 
-	serialNumber, err := certs.GenerateSerialNumber()
+	// Используем новый генератор серийных номеров
+	serialGen := serial.NewGenerator(nil) // nil пока нет БД
+	serialNum, err := serialGen.GenerateWithEntropy(160)
 	if err != nil {
 		return fmt.Errorf("не удалось сгенерировать серийный номер: %w", err)
 	}
@@ -268,7 +729,7 @@ func runCAInit(args []string, logger *log.Logger) error {
 	notAfter := notBefore.AddDate(0, 0, config.ValidityDays)
 
 	template := certs.NewRootCATemplate(
-		subject, subject, serialNumber,
+		subject, subject, serialNum.Int,
 		notBefore, notAfter,
 		keyPair.PublicKey,
 	)
@@ -307,12 +768,12 @@ func runCAInit(args []string, logger *log.Logger) error {
 	policyPath := filepath.Join(config.OutDir, "policy.txt")
 	logger.Printf("INFO: Создание документа политики в %s", policyPath)
 
-	if err := createPolicyDocument(policyPath, config, certDER, serialNumber, notBefore, notAfter); err != nil {
+	if err := createPolicyDocument(policyPath, config, certDER, serialNum.Int, notBefore, notAfter); err != nil {
 		return fmt.Errorf("не удалось создать документ политики: %w", err)
 	}
 
 	logger.Printf("INFO: Инициализация корневого CA успешно завершена")
-	logger.Printf("INFO: Серийный номер сертификата: %X", serialNumber)
+	logger.Printf("INFO: Серийный номер сертификата: %X", serialNum.Int)
 
 	fmt.Printf("\nКорневой CA успешно инициализирован!\n")
 	fmt.Printf("Сертификат: %s\n", certPath)
@@ -324,10 +785,6 @@ func runCAInit(args []string, logger *log.Logger) error {
 
 // runCAIssueIntermediate обрабатывает подкоманду 'ca issue-intermediate' для создания
 // промежуточного CA, подписанного корневым CA.
-// Функция выполняет валидацию аргументов, загружает корневой CA и создаёт
-// новый промежуточный CA с заданными параметрами.
-//
-// Возвращает ошибку, если какой-либо из шагов завершился неудачей.
 func runCAIssueIntermediate(args []string, logger *log.Logger) error {
 	cmd := flag.NewFlagSet("issue-intermediate", flag.ContinueOnError)
 
@@ -342,6 +799,7 @@ func runCAIssueIntermediate(args []string, logger *log.Logger) error {
 		outDir         string
 		validityDays   int
 		pathLen        int
+		dbPath         string
 	)
 
 	cmd.StringVar(&rootCertPath, "root-cert", "", "Путь к сертификату корневого CA (PEM)")
@@ -354,6 +812,7 @@ func runCAIssueIntermediate(args []string, logger *log.Logger) error {
 	cmd.StringVar(&outDir, "out-dir", "./pki", "Выходная директория")
 	cmd.IntVar(&validityDays, "validity-days", 1825, "Срок действия в днях")
 	cmd.IntVar(&pathLen, "pathlen", 0, "Ограничение длины пути")
+	cmd.StringVar(&dbPath, "db-path", "", "Путь к базе данных SQLite (для автоматической вставки)")
 
 	cmd.SetOutput(os.Stderr)
 
@@ -446,17 +905,32 @@ func runCAIssueIntermediate(args []string, logger *log.Logger) error {
 		return fmt.Errorf("не удалось выпустить промежуточный CA: %w", err)
 	}
 
+	// Если указан путь к БД, вставляем сертификат
+	if dbPath != "" {
+		// Читаем созданный сертификат
+		certPath := filepath.Join(outDir, "certs", "intermediate.cert.pem")
+		certPEM, err := os.ReadFile(certPath)
+		if err != nil {
+			logger.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось прочитать сертификат для БД: %v", err)
+		} else {
+			block, _ := pem.Decode(certPEM)
+			if block != nil {
+				cert, err := x509.ParseCertificate(block.Bytes)
+				if err == nil {
+					if err := ca.InsertCertificateIntoDB(dbPath, cert, certPEM, logger); err != nil {
+						logger.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось вставить сертификат в БД: %v", err)
+					}
+				}
+			}
+		}
+	}
+
 	logger.Printf("INFO: Промежуточный CA успешно выпущен")
 	return nil
 }
 
 // runCAIssueCert обрабатывает подкоманду 'ca issue-cert' для выпуска конечного
 // сертификата от промежуточного CA.
-// Функция поддерживает два режима:
-// 1. Генерация новой ключевой пары и создание сертификата
-// 2. Подписание внешнего CSR
-//
-// Возвращает ошибку, если какой-либо из шагов завершился неудачей.
 func runCAIssueCert(args []string, logger *log.Logger) error {
 	cmd := flag.NewFlagSet("issue-cert", flag.ContinueOnError)
 
@@ -472,6 +946,7 @@ func runCAIssueCert(args []string, logger *log.Logger) error {
 		validityDays int
 		keyType      string
 		keySize      int
+		dbPath       string
 	)
 
 	cmd.StringVar(&caCertPath, "ca-cert", "", "Сертификат промежуточного CA (PEM)")
@@ -485,6 +960,7 @@ func runCAIssueCert(args []string, logger *log.Logger) error {
 	cmd.IntVar(&validityDays, "validity-days", 365, "Срок действия конечного сертификата")
 	cmd.StringVar(&keyType, "key-type", "rsa", "Тип ключа для внутренней генерации: rsa или ecc")
 	cmd.IntVar(&keySize, "key-size", 0, "Размер ключа для внутренней генерации")
+	cmd.StringVar(&dbPath, "db-path", "", "Путь к базе данных SQLite (для автоматической вставки)")
 
 	cmd.SetOutput(os.Stderr)
 
@@ -601,15 +1077,46 @@ func runCAIssueCert(args []string, logger *log.Logger) error {
 		return fmt.Errorf("не удалось выпустить сертификат: %w", err)
 	}
 
+	// Если указан путь к БД, вставляем сертификат
+	if dbPath != "" {
+		// Находим последний созданный сертификат
+		files, err := filepath.Glob(filepath.Join(outDir, "*.cert.pem"))
+		if err != nil || len(files) == 0 {
+			logger.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось найти созданный сертификат для БД")
+		} else {
+			// Берем самый новый файл
+			var newest string
+			var newestTime time.Time
+			for _, f := range files {
+				info, err := os.Stat(f)
+				if err == nil && (newest == "" || info.ModTime().After(newestTime)) {
+					newest = f
+					newestTime = info.ModTime()
+				}
+			}
+
+			if newest != "" {
+				certPEM, err := os.ReadFile(newest)
+				if err == nil {
+					block, _ := pem.Decode(certPEM)
+					if block != nil {
+						cert, err := x509.ParseCertificate(block.Bytes)
+						if err == nil {
+							if err := ca.InsertCertificateIntoDB(dbPath, cert, certPEM, logger); err != nil {
+								logger.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось вставить сертификат в БД: %v", err)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	logger.Printf("INFO: Сертификат успешно выпущен")
 	return nil
 }
 
 // runCAVerify обрабатывает подкоманду 'ca verify' для проверки одного сертификата.
-// Для самоподписанных сертификатов выполняет полную проверку.
-// Для неподписанных сертификатов выводит предупреждение о необходимости проверки цепочки.
-//
-// Возвращает ошибку, если сертификат не прошел проверку.
 func runCAVerify(args []string, logger *log.Logger) error {
 	verifyCmd := flag.NewFlagSet("verify", flag.ContinueOnError)
 	var certPath string
@@ -667,10 +1174,6 @@ func runCAVerify(args []string, logger *log.Logger) error {
 
 // runCAVerifyChain обрабатывает подкоманду 'ca verify-chain' для проверки
 // полной цепочки сертификатов от конечного до корневого.
-// Функция загружает все три сертификата, проверяет их целостность,
-// связи между ними и сроки действия.
-//
-// Возвращает ошибку, если проверка цепочки не удалась.
 func runCAVerifyChain(args []string, logger *log.Logger) error {
 	cmd := flag.NewFlagSet("verify-chain", flag.ContinueOnError)
 
@@ -736,9 +1239,6 @@ func (i *arrayFlags) Set(value string) error {
 }
 
 // readPassphraseFromFile читает парольную фразу из указанного файла.
-// Функция удаляет завершающие символы новой строки и проверяет,
-// что файл не пустой. Возвращает ошибку, если файл не может быть прочитан
-// или пуст.
 func readPassphraseFromFile(path string) ([]byte, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -761,9 +1261,6 @@ func readPassphraseFromFile(path string) ([]byte, error) {
 }
 
 // setupLogging настраивает вывод логгера.
-// Если указан путь к файлу журнала, функция создаёт необходимые директории
-// и настраивает запись как в stderr, так и в файл.
-// Возвращает ошибку, если не удаётся создать директорию или открыть файл.
 func setupLogging(logger *log.Logger, logFile string) error {
 	if logFile == "" {
 		return nil
@@ -786,13 +1283,6 @@ func setupLogging(logger *log.Logger, logFile string) error {
 }
 
 // createOutputDirectories создаёт необходимые директории для выходных файлов.
-// Проверяет наличие существующих файлов и, если не указан флаг --force,
-// предотвращает их перезапись.
-// Устанавливает соответствующие права доступа для директорий
-// (0700 для private, 0755 для остальных).
-//
-// Возвращает ошибку, если не удаётся создать директорию или установить права,
-// а также если существуют файлы и не указан --force.
 func createOutputDirectories(outDir string, force bool, logger *log.Logger) error {
 	privateKeyPath := filepath.Join(outDir, "private", "ca.key.pem")
 	certPath := filepath.Join(outDir, "certs", "ca.cert.pem")
@@ -839,10 +1329,6 @@ func createOutputDirectories(outDir string, force bool, logger *log.Logger) erro
 }
 
 // createPolicyDocument создаёт документ политики для корневого CA.
-// Документ включает информацию о сертификате, сроке действия,
-// используемых криптографических алгоритмах, расширениях и мерах безопасности.
-//
-// Возвращает ошибку, если не удаётся разобрать сертификат или записать файл.
 func createPolicyDocument(path string, config Config, certDER []byte,
 	serialNumber *big.Int, notBefore, notAfter time.Time) error {
 

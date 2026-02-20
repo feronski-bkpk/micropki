@@ -1,8 +1,10 @@
 #!/usr/bin/env make
-# MicroPKI Makefile
+# MicroPKI Makefile - Спринт 3: Интеграция с БД и HTTP репозиторий
 
 .PHONY: help build clean test test-verbose test-coverage lint fmt vet run \
-        example verify install uninstall release security-check check-all
+        example verify install uninstall release security-check check-all \
+        test-db test-repo test-integration-sprint3 db-init repo-serve \
+        list-certs show-cert repo-status test-serial-uniqueness
 
 # ============================================================================
 # Переменные конфигурации
@@ -22,6 +24,12 @@ LDFLAGS         := -ldflags="-X main.version=$(VERSION) -X main.buildTime=$(BUIL
 EXAMPLE_DIR     := ./pki-example
 EXAMPLE_LOG     := ./example.log
 EXAMPLE_PASS    := ./pass.txt
+EXAMPLE_DB      := $(EXAMPLE_DIR)/micropki.db
+
+# Параметры для репозитория
+REPO_HOST       := 127.0.0.1
+REPO_PORT       := 8080
+REPO_PID_FILE   := /tmp/micropki-repo.pid
 
 # Цвета для вывода
 ifneq (,$(TERM))
@@ -45,16 +53,29 @@ endif
 # ============================================================================
 
 help:
-	@echo "${BOLD}${BLUE}MicroPKI Makefile${RESET}"
+	@echo "${BOLD}${BLUE}MicroPKI Makefile - Спринт 3${RESET}"
 	@echo "${YELLOW}Usage:${RESET} make ${GREEN}<target>${RESET}\n"
-	@echo "${BOLD}Available targets:${RESET}"
+	@echo "${BOLD}Основные цели:${RESET}"
 	@sed -n '/^## /{s/## \(.*\):\(.*\)/  ${GREEN}\1${RESET}${BLUE}:${RESET} \2/p}' $(MAKEFILE_LIST)
 	@echo ""
-	@echo "${BOLD}Examples:${RESET}"
+	@echo "${BOLD}Новые цели Спринта 3:${RESET}"
+	@echo "  ${GREEN}test-db${RESET}${BLUE}:${RESET} тестирование базы данных"
+	@echo "  ${GREEN}test-repo${RESET}${BLUE}:${RESET} тестирование репозитория"
+	@echo "  ${GREEN}test-integration-sprint3${RESET}${BLUE}:${RESET} интеграционные тесты спринта 3"
+	@echo "  ${GREEN}db-init${RESET}${BLUE}:${RESET} инициализация базы данных"
+	@echo "  ${GREEN}repo-serve${RESET}${BLUE}:${RESET} запуск HTTP сервера репозитория"
+	@echo "  ${GREEN}repo-stop${RESET}${BLUE}:${RESET} остановка HTTP сервера"
+	@echo "  ${GREEN}repo-status${RESET}${BLUE}:${RESET} проверка статуса сервера"
+	@echo "  ${GREEN}list-certs${RESET}${BLUE}:${RESET} список всех сертификатов"
+	@echo "  ${GREEN}show-cert${RESET}${BLUE}:${RESET} показать сертификат по серийному номеру"
+	@echo "  ${GREEN}test-serial-uniqueness${RESET}${BLUE}:${RESET} тест уникальности серийных номеров"
+	@echo ""
+	@echo "${BOLD}Примеры:${RESET}"
 	@echo "  ${GREEN}make build${RESET}         - собрать бинарник"
 	@echo "  ${GREEN}make test${RESET}          - запустить тесты"
-	@echo "  ${GREEN}make example${RESET}       - создать пример CA"
-	@echo "  ${GREEN}make verify${RESET}        - проверить пример CA"
+	@echo "  ${GREEN}make db-init${RESET}       - инициализировать БД"
+	@echo "  ${GREEN}make example-full${RESET}  - полный пример PKI с БД"
+	@echo "  ${GREEN}make repo-serve${RESET}    - запустить репозиторий"
 	@echo "  ${GREEN}make clean${RESET}         - очистить всё"
 
 ## default: сборка по умолчанию
@@ -63,6 +84,7 @@ default: build
 ## build: собирает бинарный файл
 build:
 	@echo "${BOLD}${BLUE}→ Building ${BINARY_NAME}...${RESET}"
+	@go mod tidy
 	@go build $(LDFLAGS) -o $(BINARY_NAME) $(MAIN_PACKAGE)
 	@echo "${GREEN}✓ Build completed${RESET}"
 	@ls -lah $(BINARY_NAME)
@@ -76,6 +98,9 @@ clean:
 	@rm -rf $(EXAMPLE_DIR)
 	@rm -f $(EXAMPLE_LOG)
 	@rm -f pass.txt
+	@rm -f *.db
+	@rm -rf ./pki
+	@make repo-stop >/dev/null 2>&1 || true
 	@echo "${GREEN}✓ Clean completed${RESET}"
 
 ## test: запускает тесты
@@ -140,6 +165,58 @@ example: clean-example build
 	@echo "\n${GREEN}✓ Example created in $(EXAMPLE_DIR)${RESET}"
 	@echo "${YELLOW}Certificate info:${RESET}"
 	@openssl x509 -in $(EXAMPLE_DIR)/certs/ca.cert.pem -text -noout 2>/dev/null | head -12 || echo "  Certificate created successfully"
+
+## example-full: создает полную PKI иерархию с БД
+example-full: clean build
+	@echo "${BOLD}${BLUE}→ Creating full PKI hierarchy with database...${RESET}"
+	@mkdir -p ./pki
+	
+	# Инициализация БД
+	@echo "${YELLOW}1. Инициализация базы данных${RESET}"
+	@./$(BINARY_NAME) db init --db-path ./pki/micropki.db
+	
+	# Root CA
+	@echo "${YELLOW}2. Создание корневого CA${RESET}"
+	@echo "rootpass123" > ./pki/root-pass.txt
+	@./$(BINARY_NAME) ca init \
+		--subject "/CN=Test Root CA/O=MicroPKI/C=RU" \
+		--key-type rsa \
+		--key-size 4096 \
+		--passphrase-file ./pki/root-pass.txt \
+		--out-dir ./pki/root \
+		--validity-days 3650
+	
+	# Intermediate CA
+	@echo "${YELLOW}3. Создание промежуточного CA${RESET}"
+	@echo "intpass123" > ./pki/int-pass.txt
+	@./$(BINARY_NAME) ca issue-intermediate \
+		--root-cert ./pki/root/certs/ca.cert.pem \
+		--root-key ./pki/root/private/ca.key.pem \
+		--root-pass-file ./pki/root-pass.txt \
+		--subject "/CN=Test Intermediate CA/O=MicroPKI/C=RU" \
+		--key-type rsa \
+		--key-size 4096 \
+		--passphrase-file ./pki/int-pass.txt \
+		--out-dir ./pki/intermediate \
+		--db-path ./pki/micropki.db
+	
+	# Выпуск тестовых сертификатов
+	@echo "${YELLOW}4. Выпуск тестовых сертификатов${RESET}"
+	@for i in 1 2 3; do \
+		./$(BINARY_NAME) ca issue-cert \
+			--ca-cert ./pki/intermediate/certs/intermediate.cert.pem \
+			--ca-key ./pki/intermediate/private/intermediate.key.pem \
+			--ca-pass-file ./pki/int-pass.txt \
+			--template server \
+			--subject "CN=test$$i.example.com" \
+			--san dns:test$$i.example.com \
+			--out-dir ./pki/certs \
+			--db-path ./pki/micropki.db; \
+	done
+	
+	@echo "${GREEN}✓ Full PKI hierarchy created in ./pki${RESET}"
+	@echo "${GREEN}✓ Database: ./pki/micropki.db${RESET}"
+	@./$(BINARY_NAME) ca list-certs --db-path ./pki/micropki.db --format table
 
 ## verify: проверяет созданный сертификат
 verify:
@@ -206,6 +283,202 @@ tools:
 	@go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest 2>/dev/null || true
 	@go install golang.org/x/vuln/cmd/govulncheck@latest 2>/dev/null || true
 	@echo "${GREEN}✓ Tools installed${RESET}"
+
+# ============================================================================
+# Цели для Спринта 3
+# ============================================================================
+
+## test-db: тестирование базы данных
+test-db:
+	@echo "${BOLD}${BLUE}→ Testing database package...${RESET}"
+	@go test -v ./micropki/internal/database -count=1 -cover
+
+## test-repo: тестирование репозитория
+test-repo:
+	@echo "${BOLD}${BLUE}→ Testing repository package...${RESET}"
+	@go test -v ./micropki/internal/repository -count=1 -cover
+
+## test-serial: тестирование генератора серийных номеров
+test-serial:
+	@echo "${BOLD}${BLUE}→ Testing serial generator...${RESET}"
+	@go test -v ./micropki/internal/serial -count=1 -cover
+
+## test-integration-sprint3: интеграционные тесты для спринта 3
+test-integration-sprint3: build
+	@echo "${BOLD}${BLUE}→ Running Sprint 3 integration tests...${RESET}"
+	@chmod +x ./scripts/test-sprint3.sh
+	@./scripts/test-sprint3.sh
+
+## db-init: инициализация базы данных
+db-init:
+	@echo "${BOLD}${BLUE}→ Initializing database...${RESET}"
+	@mkdir -p ./pki
+	@./$(BINARY_NAME) db init --db-path ./pki/micropki.db
+	@echo "${GREEN}✓ Database initialized at ./pki/micropki.db${RESET}"
+
+## list-certs: список всех сертификатов в БД
+list-certs:
+	@echo "${BOLD}${BLUE}→ Listing certificates from database...${RESET}"
+	@./$(BINARY_NAME) ca list-certs --db-path ./pki/micropki.db --format table
+
+## show-cert: показать сертификат по серийному номеру
+show-cert:
+	@if [ -z "$(SERIAL)" ]; then \
+		echo "${RED}Error: SERIAL not set. Use: make show-cert SERIAL=<hex>${RESET}"; \
+		exit 1; \
+	fi
+	@echo "${BOLD}${BLUE}→ Showing certificate $(SERIAL)...${RESET}"
+	@./$(BINARY_NAME) ca show-cert $(SERIAL) --db-path ./pki/micropki.db --format pem
+
+## repo-serve: запуск HTTP сервера репозитория
+repo-serve:
+	@echo "${BOLD}${BLUE}→ Starting repository server on $(REPO_HOST):$(REPO_PORT)...${RESET}"
+	@mkdir -p ./pki/certs
+	@./$(BINARY_NAME) repo serve \
+		--host $(REPO_HOST) \
+		--port $(REPO_PORT) \
+		--db-path ./pki/micropki.db \
+		--cert-dir ./pki/certs \
+		--log-file ./pki/repo.log &
+	@echo $$! > $(REPO_PID_FILE)
+	@sleep 2
+	@echo "${GREEN}✓ Server started with PID $$(cat $(REPO_PID_FILE))${RESET}"
+	@echo "${YELLOW}API endpoints:${RESET}"
+	@echo "  GET http://$(REPO_HOST):$(REPO_PORT)/certificate/<serial>"
+	@echo "  GET http://$(REPO_HOST):$(REPO_PORT)/ca/root"
+	@echo "  GET http://$(REPO_HOST):$(REPO_PORT)/ca/intermediate"
+	@echo "  GET http://$(REPO_HOST):$(REPO_PORT)/crl"
+	@echo "  GET http://$(REPO_HOST):$(REPO_PORT)/health"
+
+## repo-stop: остановка HTTP сервера
+repo-stop:
+	@echo "${YELLOW}→ Stopping repository server...${RESET}"
+	@if [ -f $(REPO_PID_FILE) ]; then \
+		kill -9 $$(cat $(REPO_PID_FILE)) 2>/dev/null || true; \
+		rm -f $(REPO_PID_FILE); \
+		echo "${GREEN}✓ Server stopped${RESET}"; \
+	else \
+		echo "${YELLOW}No PID file found, server may not be running${RESET}"; \
+	fi
+
+## repo-status: проверка статуса сервера
+repo-status:
+	@echo "${BOLD}${BLUE}→ Checking repository server status...${RESET}"
+	@if [ -f $(REPO_PID_FILE) ] && kill -0 $$(cat $(REPO_PID_FILE)) 2>/dev/null; then \
+		echo "${GREEN}✓ Server is running (PID: $$(cat $(REPO_PID_FILE)))${RESET}"; \
+		curl -s http://$(REPO_HOST):$(REPO_PORT)/health | jq . 2>/dev/null || echo "  Health check available at /health"; \
+	else \
+		echo "${RED}✗ Server is not running${RESET}"; \
+	fi
+
+## test-api: тестирование API репозитория
+test-api: repo-serve
+	@echo "${BOLD}${BLUE}→ Testing API endpoints...${RESET}"
+	@sleep 2
+	
+	@echo "\n${YELLOW}1. Health check:${RESET}"
+	@curl -s http://$(REPO_HOST):$(REPO_PORT)/health | jq . 2>/dev/null || curl -s http://$(REPO_HOST):$(REPO_PORT)/health
+	
+	@echo "\n${YELLOW}2. Get root CA:${RESET}"
+	@curl -s http://$(REPO_HOST):$(REPO_PORT)/ca/root -o /tmp/root-test.pem
+	@echo "  Downloaded $(shell wc -c < /tmp/root-test.pem) bytes"
+	
+	@echo "\n${YELLOW}3. Get intermediate CA:${RESET}"
+	@curl -s http://$(REPO_HOST):$(REPO_PORT)/ca/intermediate -o /tmp/int-test.pem
+	@echo "  Downloaded $(shell wc -c < /tmp/int-test.pem) bytes"
+	
+	@echo "\n${YELLOW}4. Get CRL (placeholder):${RESET}"
+	@curl -s http://$(REPO_HOST):$(REPO_PORT)/crl
+	
+	@make repo-stop
+
+## test-serial-uniqueness: тест уникальности серийных номеров
+test-serial-uniqueness: build
+	@echo "${BOLD}${BLUE}→ Testing serial number uniqueness (100 certs)...${RESET}"
+	@mkdir -p ./pki-test
+	@./$(BINARY_NAME) db init --db-path ./pki-test/test.db
+	
+	@echo "rootpass" > ./pki-test/root-pass.txt
+	@./$(BINARY_NAME) ca init \
+		--subject "/CN=Test Root CA" \
+		--key-type rsa \
+		--key-size 4096 \
+		--passphrase-file ./pki-test/root-pass.txt \
+		--out-dir ./pki-test/root \
+		--validity-days 365 > /dev/null 2>&1
+	
+	@echo "intpass" > ./pki-test/int-pass.txt
+	@./$(BINARY_NAME) ca issue-intermediate \
+		--root-cert ./pki-test/root/certs/ca.cert.pem \
+		--root-key ./pki-test/root/private/ca.key.pem \
+		--root-pass-file ./pki-test/root-pass.txt \
+		--subject "/CN=Test Intermediate CA" \
+		--key-type rsa \
+		--key-size 4096 \
+		--passphrase-file ./pki-test/int-pass.txt \
+		--out-dir ./pki-test/intermediate \
+		--db-path ./pki-test/test.db > /dev/null 2>&1
+	
+	@echo "${YELLOW}Generating 100 certificates...${RESET}"
+	@for i in $$(seq 1 100); do \
+		./$(BINARY_NAME) ca issue-cert \
+			--ca-cert ./pki-test/intermediate/certs/intermediate.cert.pem \
+			--ca-key ./pki-test/intermediate/private/intermediate.key.pem \
+			--ca-pass-file ./pki-test/int-pass.txt \
+			--template server \
+			--subject "CN=test$$i.example.com" \
+			--out-dir ./pki-test/certs \
+			--db-path ./pki-test/test.db > /dev/null 2>&1; \
+		if [ $$? -ne 0 ]; then \
+			echo "${RED}✗ Failed at certificate $$i${RESET}"; \
+			exit 1; \
+		fi; \
+		if [ $$(($$i % 10)) -eq 0 ]; then \
+			echo "  $$i/100 completed"; \
+		fi; \
+	done
+	
+	@echo "${GREEN}✓ All 100 certificates generated successfully${RESET}"
+	
+	@COUNT=$$(sqlite3 ./pki-test/test.db "SELECT COUNT(DISTINCT serial_hex) FROM certificates;" 2>/dev/null || echo 0); \
+	if [ "$$COUNT" -eq 100 ]; then \
+		echo "${GREEN}✓ All serial numbers are unique${RESET}"; \
+	else \
+		echo "${RED}✗ Duplicate serial numbers found! Expected 100, got $$COUNT${RESET}"; \
+		exit 1; \
+	fi
+	
+	@rm -rf ./pki-test
+
+## benchmark-db: тест производительности БД
+benchmark-db:
+	@echo "${BOLD}${BLUE}→ Benchmarking database performance...${RESET}"
+	@go test -bench=. -benchmem ./micropki/internal/database
+
+## benchmark-serial: тест производительности генератора серийных номеров
+benchmark-serial:
+	@echo "${BOLD}${BLUE}→ Benchmarking serial generator...${RESET}"
+	@go test -bench=. -benchmem ./micropki/internal/serial
+
+## coverage-html: открыть отчет покрытия в браузере
+coverage-html: test-coverage
+	@open $(COVERAGE_HTML) 2>/dev/null || xdg-open $(COVERAGE_HTML) 2>/dev/null || echo "${YELLOW}Coverage report: $(COVERAGE_HTML)${RESET}"
+
+## deps: показать все зависимости
+deps:
+	@echo "${BOLD}${BLUE}→ Dependencies:${RESET}"
+	@go mod graph
+
+## clean-all: полная очистка
+clean-all: clean
+	@rm -rf ./pki-test
+	@rm -rf ./releases
+	@rm -f *.log
+	@rm -f *.db
+	@rm -f *.out
+	@rm -f *.html
+	@rm -f $(REPO_PID_FILE)
+	@echo "${GREEN}✓ Full clean completed${RESET}"
 
 %:
 	@echo "${RED}Unknown target: $@${RESET}"
