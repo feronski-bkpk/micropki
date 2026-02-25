@@ -56,8 +56,6 @@ type CAConfig struct {
 //  8. Сохранение сертификата
 //  9. Обновление документа политики
 //
-// Функция соответствует требованиям CLI-7, PKI-6 и PKI-7.
-//
 // Возвращает ошибку, если какой-либо из шагов завершился неудачей.
 func IssueIntermediate(cfg *CAConfig) error {
 	// 1. Загрузка сертификата и ключа корневого CA
@@ -193,8 +191,6 @@ type IssueCertificateConfig struct {
 //  7. Сохранение сертификата
 //  8. Сохранение закрытого ключа (если генерировался)
 //
-// Функция соответствует требованиям CLI-8, PKI-8, PKI-9 и PKI-11.
-//
 // Возвращает ошибку, если какой-либо из шагов завершился неудачей.
 func IssueCertificate(cfg *IssueCertificateConfig) error {
 	// 1. Загрузка сертификата и ключа CA
@@ -208,9 +204,8 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		return fmt.Errorf("не удалось загрузить закрытый ключ CA: %w", err)
 	}
 
-	// 2. Проверка CA (опционально, но рекомендуется)
+	// 2. Проверка CA
 	if caCert.IsCA && caCert.MaxPathLen == 0 {
-		// Это нормально - промежуточный CA с pathlen=0 может выпускать конечные сертификаты
 	}
 
 	// 3. Проверка совместимости шаблона с SAN
@@ -278,7 +273,7 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		return fmt.Errorf("не удалось создать шаблон: %w", err)
 	}
 
-	// 8. Создание сертификата (CA подписывает новый сертификат)
+	// 8. Создание сертификата
 	certDER, err := x509.CreateCertificate(
 		rand.Reader,
 		template,  // шаблон нового сертификата
@@ -318,7 +313,7 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		fmt.Printf("ПРЕДУПРЕЖДЕНИЕ: Закрытый ключ сохранён без шифрования в %s\n", keyPath)
 	}
 
-	// 13. Логирование выпуска (для аудита)
+	// 13. Логирование выпуска
 	fmt.Printf("\nСертификат успешно выпущен!\n")
 	fmt.Printf("Тип: %s\n", cfg.Template)
 	fmt.Printf("Сертификат: %s\n", certPath)
@@ -357,7 +352,7 @@ func processExternalCSR(cfg *IssueCertificateConfig) (*pkix.Name, []templates.SA
 		return nil, nil, nil, fmt.Errorf("не удалось разобрать CSR: %w", err)
 	}
 
-	// Проверка, не запрашивает ли CSR права CA (должно быть отклонено для конечных сертификатов)
+	// Проверка, не запрашивает ли CSR права CA
 	if csr.IsCARequest(parsedCSR) {
 		return nil, nil, nil, fmt.Errorf("CSR запрашивает CA=true - не разрешено для конечных сертификатов")
 	}

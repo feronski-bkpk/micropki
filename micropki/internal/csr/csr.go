@@ -66,9 +66,9 @@ func GenerateIntermediateCSR(cfg *CSRConfig) ([]byte, error) {
 		Extensions: []pkix.Extension{},
 	}
 
-	// Добавление расширения Basic Constraints для CA (PKI-6)
+	// Добавление расширения Basic Constraints для CA
 	if cfg.IsCA {
-		// OID для Basic Constraints: 2.5.29.19
+		// OID для Basic Constraints
 		// ASN.1 кодировка для CA=TRUE с pathLenConstraint
 		var extValue []byte
 		if cfg.MaxPathLen >= 0 {
@@ -160,7 +160,7 @@ func ExtractPublicKey(csr *x509.CertificateRequest) (crypto.PublicKey, error) {
 //   - true, если CSR содержит расширение Basic Constraints (признак запроса CA)
 func IsCARequest(csr *x509.CertificateRequest) bool {
 	for _, ext := range csr.Extensions {
-		// Проверка расширения Basic Constraints (OID 2.5.29.19)
+		// Проверка расширения Basic Constraints
 		if ext.Id.Equal([]int{2, 5, 29, 19}) {
 			// Полный парсинг сложен, но наличие расширения достаточно для определения
 			// запроса прав CA

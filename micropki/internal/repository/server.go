@@ -169,10 +169,9 @@ func (s *Server) handleCertificate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Проверяем статус (для Sprint 3 возвращаем даже отозванные)
+	// Проверяем статус
 	if record.Status == "revoked" {
 		s.logger.Printf("Предупреждение: запрошен отозванный сертификат %s", serialHex)
-		// Можем вернуть 410 Gone, но в Sprint 3 возвращаем сертификат
 	}
 
 	// Отправляем PEM сертификат
@@ -229,14 +228,13 @@ func (s *Server) handleCA(w http.ResponseWriter, r *http.Request) {
 	w.Write(certPEM)
 }
 
-// handleCRL обрабатывает GET /crl (заглушка для Sprint 4)
+// handleCRL обрабатывает GET /crl
 func (s *Server) handleCRL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Заглушка для Sprint 3
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusNotImplemented)
 	w.Write([]byte("CRL generation not yet implemented (Sprint 4)"))

@@ -219,7 +219,7 @@ func NewCodeSigningTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 
-		// Key Usage: digitalSignature (PKI-8)
+		// Key Usage: digitalSignature
 		KeyUsage: x509.KeyUsageDigitalSignature,
 
 		// Extended Key Usage: codeSigning

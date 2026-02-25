@@ -11,8 +11,6 @@
 //   - Корневой CA (самоподписанный)
 //   - Промежуточный CA (подписан корневым)
 //   - Конечный сертификат (подписан промежуточным)
-//
-// Пакет реализует требования TEST-7.
 package chain
 
 import (
@@ -105,11 +103,6 @@ func LoadCertificate(path string) (*x509.Certificate, error) {
 }
 
 // Verify проверяет полную цепочку сертификатов.
-// Реализует требования TEST-7:
-//   - Проверка подписей на каждом уровне
-//   - Проверка сроков действия
-//   - Проверка Basic Constraints (флаг CA и ограничения длины пути)
-//   - Проверка совместимости Key Usage / Extended Key Usage
 //
 // Последовательность проверок:
 //  1. Конечный сертификат не должен быть CA
@@ -219,7 +212,7 @@ func (c *Chain) VerifyWithOpenSSLCompatibility() error {
 	// Проверка критичности Basic Constraints для CA сертификатов
 	for _, cert := range []*x509.Certificate{c.Leaf, c.Intermediate, c.Root} {
 		for _, ext := range cert.Extensions {
-			// Проверка расширения Basic Constraints (OID 2.5.29.19)
+			// Проверка расширения Basic Constraints
 			if ext.Id.Equal([]int{2, 5, 29, 19}) {
 				if !ext.Critical && cert.IsCA {
 					return fmt.Errorf("расширение Basic Constraints должно быть критическим для CA сертификатов")
