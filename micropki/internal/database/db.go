@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -21,10 +22,24 @@ type CertificateRecord struct {
 	NotBefore        time.Time
 	NotAfter         time.Time
 	CertPEM          string
-	Status           string // 'valid', 'revoked', 'expired'
+	Status           string
 	RevocationReason sql.NullString
 	RevocationDate   sql.NullTime
 	CreatedAt        time.Time
+}
+
+// CRLMetadata представляет метаданные CRL в базе данных.
+type CRLMetadata struct {
+	ID            int
+	CASubject     string
+	CRLNumber     int
+	LastGenerated time.Time
+	ThisUpdate    time.Time
+	NextUpdate    time.Time
+	CRLPath       string
+	RevokedCount  int
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // DB представляет подключение к базе данных SQLite.
@@ -36,7 +51,6 @@ type DB struct {
 // New создает новое подключение к базе данных SQLite.
 // Если база данных не существует, она будет создана при вызове InitSchema.
 func New(dbPath string) (*DB, error) {
-	// Убеждаемся, что директория для базы данных существует
 	dbDir := filepath.Dir(dbPath)
 	if dbDir != "." && dbDir != "" {
 		if err := os.MkdirAll(dbDir, 0700); err != nil {
@@ -49,7 +63,6 @@ func New(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("не удалось открыть базу данных: %w", err)
 	}
 
-	// Проверяем подключение
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("не удалось подключиться к БД: %w", err)
 	}
@@ -58,22 +71,9 @@ func New(dbPath string) (*DB, error) {
 }
 
 // InitSchema создает схему базы данных, если она еще не существует.
-// Функция идемпотентна - может вызываться без ошибок.
 func (db *DB) InitSchema() error {
-	// Проверяем, существует ли уже таблица
-	var tableName string
-	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='certificates'`).Scan(&tableName)
-	if err == nil {
-		// Таблица уже существует - ничего не делаем
-		return nil
-	}
-	if err != sql.ErrNoRows {
-		return fmt.Errorf("ошибка при проверке существования таблицы: %w", err)
-	}
-
-	// Создаем таблицу сертификатов
 	createTableSQL := `
-	CREATE TABLE certificates (
+	CREATE TABLE IF NOT EXISTS certificates (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		serial_hex TEXT UNIQUE NOT NULL,
 		subject TEXT NOT NULL,
@@ -87,14 +87,55 @@ func (db *DB) InitSchema() error {
 		created_at TEXT NOT NULL
 	);
 	
-	CREATE INDEX idx_serial_hex ON certificates(serial_hex);
-	CREATE INDEX idx_status ON certificates(status);
-	CREATE INDEX idx_not_after ON certificates(not_after);
+	CREATE INDEX IF NOT EXISTS idx_serial_hex ON certificates(serial_hex);
+	CREATE INDEX IF NOT EXISTS idx_status ON certificates(status);
+	CREATE INDEX IF NOT EXISTS idx_issuer ON certificates(issuer);
+	CREATE INDEX IF NOT EXISTS idx_not_after ON certificates(not_after);
 	`
 
-	_, err = db.Exec(createTableSQL)
+	_, err := db.Exec(createTableSQL)
 	if err != nil {
 		return fmt.Errorf("не удалось создать таблицу certificates: %w", err)
+	}
+
+	return nil
+}
+
+// InitCRLSchema создает таблицы для CRL, если они не существуют.
+func (db *DB) InitCRLSchema() error {
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS crl_metadata (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		ca_subject TEXT NOT NULL UNIQUE,
+		crl_number INTEGER NOT NULL,
+		last_generated TEXT NOT NULL,
+		this_update TEXT NOT NULL,
+		next_update TEXT NOT NULL,
+		crl_path TEXT NOT NULL,
+		revoked_count INTEGER DEFAULT 0,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+	
+	CREATE INDEX IF NOT EXISTS idx_crl_ca_subject ON crl_metadata(ca_subject);
+	`
+
+	_, err := db.Exec(createTableSQL)
+	if err != nil {
+		return fmt.Errorf("не удалось создать таблицу crl_metadata: %w", err)
+	}
+
+	return nil
+}
+
+// InitSchemaWithCRL инициализирует схему базы данных, включая CRL таблицы.
+func (db *DB) InitSchemaWithCRL() error {
+	if err := db.InitSchema(); err != nil {
+		return err
+	}
+
+	if err := db.InitCRLSchema(); err != nil {
+		return err
 	}
 
 	return nil
@@ -103,18 +144,15 @@ func (db *DB) InitSchema() error {
 // InsertCertificate вставляет новую запись сертификата в базу данных.
 // Возвращает ошибку, если сертификат с таким серийным номером уже существует.
 func (db *DB) InsertCertificate(record *CertificateRecord) error {
-	// Конвертируем время в ISO 8601 строку
 	notBefore := record.NotBefore.UTC().Format(time.RFC3339)
 	notAfter := record.NotAfter.UTC().Format(time.RFC3339)
 	createdAt := time.Now().UTC().Format(time.RFC3339)
 
-	// Убеждаемся, что статус установлен
 	status := record.Status
 	if status == "" {
 		status = "valid"
 	}
 
-	// Вставляем запись
 	insertSQL := `
 	INSERT INTO certificates (
 		serial_hex, subject, issuer, not_before, not_after, cert_pem, status, created_at
@@ -174,7 +212,6 @@ func (db *DB) GetCertificateBySerial(serialHex string) (*CertificateRecord, erro
 		return nil, fmt.Errorf("ошибка при получении сертификата: %w", err)
 	}
 
-	// Парсим временные метки
 	record.NotBefore, err = time.Parse(time.RFC3339, notBeforeStr)
 	if err != nil {
 		return nil, fmt.Errorf("не удалось распарсить not_before: %w", err)
@@ -188,7 +225,6 @@ func (db *DB) GetCertificateBySerial(serialHex string) (*CertificateRecord, erro
 		return nil, fmt.Errorf("не удалось распарсить created_at: %w", err)
 	}
 
-	// Обрабатываем NULL поля
 	if revocationReason.Valid {
 		record.RevocationReason = revocationReason
 	}
@@ -266,7 +302,6 @@ func (db *DB) UpdateCertificateStatus(serialHex string, status string, reason st
 	var err error
 
 	if status == "revoked" && reason != "" {
-		// Отзыв сертификата
 		revocationDate := time.Now().UTC().Format(time.RFC3339)
 		updateSQL := `
 		UPDATE certificates 
@@ -275,7 +310,6 @@ func (db *DB) UpdateCertificateStatus(serialHex string, status string, reason st
 		`
 		_, err = db.Exec(updateSQL, status, reason, revocationDate, serialHex)
 	} else {
-		// Простое обновление статуса
 		updateSQL := `
 		UPDATE certificates 
 		SET status = ?
@@ -327,6 +361,153 @@ func (db *DB) GetRevokedCertificates() ([]*CertificateRecord, error) {
 	}
 
 	return records, nil
+}
+
+// GetRevokedCertificatesForIssuer возвращает все отозванные сертификаты для указанного издателя.
+func (db *DB) GetRevokedCertificatesForIssuer(issuer string) ([]*CertificateRecord, error) {
+	querySQL := `
+    SELECT serial_hex, revocation_reason, revocation_date
+    FROM certificates
+    WHERE status = 'revoked' AND issuer = ?
+    ORDER BY revocation_date DESC
+    `
+
+	rows, err := db.Query(querySQL, issuer)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка при запросе отозванных сертификатов: %w", err)
+	}
+	defer rows.Close()
+
+	var records []*CertificateRecord
+	for rows.Next() {
+		record := &CertificateRecord{}
+		var revocationDateStr string
+
+		err := rows.Scan(
+			&record.SerialHex,
+			&record.RevocationReason,
+			&revocationDateStr,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("ошибка при сканировании строки: %w", err)
+		}
+
+		record.SerialHex = strings.ToUpper(record.SerialHex)
+
+		if revocationDateStr != "" {
+			revDate, err := time.Parse(time.RFC3339, revocationDateStr)
+			if err != nil {
+				record.RevocationDate = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+			} else {
+				record.RevocationDate = sql.NullTime{Time: revDate, Valid: true}
+			}
+		} else {
+			record.RevocationDate = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+		}
+
+		records = append(records, record)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("ошибка при итерации по строкам: %w", err)
+	}
+
+	return records, nil
+}
+
+// UpdateCRLMetadata обновляет метаданные CRL для указанного CA.
+func (db *DB) UpdateCRLMetadata(metadata *CRLMetadata) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	var count int
+	err := db.QueryRow(
+		"SELECT COUNT(*) FROM crl_metadata WHERE ca_subject = ?",
+		metadata.CASubject,
+	).Scan(&count)
+
+	if err != nil {
+		return fmt.Errorf("ошибка при проверке существования метаданных: %w", err)
+	}
+
+	if count == 0 {
+		_, err = db.Exec(
+			`INSERT INTO crl_metadata 
+			 (ca_subject, crl_number, last_generated, this_update, next_update, 
+			  crl_path, revoked_count, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			metadata.CASubject,
+			metadata.CRLNumber,
+			metadata.LastGenerated.Format(time.RFC3339),
+			metadata.ThisUpdate.Format(time.RFC3339),
+			metadata.NextUpdate.Format(time.RFC3339),
+			metadata.CRLPath,
+			metadata.RevokedCount,
+			now,
+			now,
+		)
+	} else {
+		_, err = db.Exec(
+			`UPDATE crl_metadata 
+			 SET crl_number = ?, last_generated = ?, this_update = ?, next_update = ?,
+			     crl_path = ?, revoked_count = ?, updated_at = ?
+			 WHERE ca_subject = ?`,
+			metadata.CRLNumber,
+			metadata.LastGenerated.Format(time.RFC3339),
+			metadata.ThisUpdate.Format(time.RFC3339),
+			metadata.NextUpdate.Format(time.RFC3339),
+			metadata.CRLPath,
+			metadata.RevokedCount,
+			now,
+			metadata.CASubject,
+		)
+	}
+
+	if err != nil {
+		return fmt.Errorf("не удалось обновить метаданные CRL: %w", err)
+	}
+
+	return nil
+}
+
+// GetCRLMetadata возвращает метаданные CRL для указанного CA.
+func (db *DB) GetCRLMetadata(caSubject string) (*CRLMetadata, error) {
+	var (
+		lastGeneratedStr, thisUpdateStr, nextUpdateStr, createdAtStr, updatedAtStr string
+		metadata                                                                   = &CRLMetadata{CASubject: caSubject}
+	)
+
+	err := db.QueryRow(
+		`SELECT id, crl_number, last_generated, this_update, next_update, 
+		        crl_path, revoked_count, created_at, updated_at
+		 FROM crl_metadata 
+		 WHERE ca_subject = ?`,
+		caSubject,
+	).Scan(
+		&metadata.ID,
+		&metadata.CRLNumber,
+		&lastGeneratedStr,
+		&thisUpdateStr,
+		&nextUpdateStr,
+		&metadata.CRLPath,
+		&metadata.RevokedCount,
+		&createdAtStr,
+		&updatedAtStr,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ошибка при получении метаданных CRL: %w", err)
+	}
+
+	metadata.LastGenerated, _ = time.Parse(time.RFC3339, lastGeneratedStr)
+	metadata.ThisUpdate, _ = time.Parse(time.RFC3339, thisUpdateStr)
+	metadata.NextUpdate, _ = time.Parse(time.RFC3339, nextUpdateStr)
+	metadata.CreatedAt, _ = time.Parse(time.RFC3339, createdAtStr)
+	metadata.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAtStr)
+
+	return metadata, nil
 }
 
 // Close закрывает подключение к базе данных.

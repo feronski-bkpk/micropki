@@ -1,6 +1,6 @@
 # MicroPKI - Минимальная инфраструктура публичных ключей
 
-MicroPKI — это профессиональный инструмент командной строки для создания и управления инфраструктурой публичных ключей (PKI) с поддержкой корневых и промежуточных центров сертификации, выпуска сертификатов различных типов, а также **хранения сертификатов в базе данных SQLite** и **HTTP репозитория** для обслуживания сертификатов по REST API.
+MicroPKI — это инструмент командной строки для создания и управления инфраструктурой публичных ключей (PKI) с поддержкой корневых и промежуточных центров сертификации, выпуска сертификатов различных типов, а также системой управления списками отзыва сертификатов (CRL).
 
 ## Содержание
 
@@ -9,6 +9,7 @@ MicroPKI — это профессиональный инструмент ком
 - [Установка](#установка)
 - [Использование](#использование)
   - [Команды CA](#команды-ca)
+  - [Команды управления CRL](#команды-управления-crl)
   - [Команды базы данных](#команды-базы-данных)
   - [Команды репозитория](#команды-репозитория)
 - [Примеры](#примеры)
@@ -43,6 +44,16 @@ MicroPKI — это профессиональный инструмент ком
   - URI
 - **Подпись внешних CSR** (Certificate Signing Requests)
 
+### **Управление отзывом сертификатов (CRL)**
+- **Полная поддержка CRL версии 2 (v2)** согласно RFC 5280
+- **Отзыв сертификатов** с указанием причины:
+  - 10 стандартных причин отзыва (keyCompromise, cACompromise, affiliationChanged и др.)
+- **Генерация CRL** для корневого и промежуточных CA
+- **Монотонные номера CRL** - автоматическое увеличение при каждой генерации
+- **Хранение метаданных CRL** в базе данных SQLite
+- **HTTP распространение CRL** с правильными заголовками кэширования
+- **Проверка статуса сертификата** по серийному номеру
+
 ### **Безопасность**
 - Использование только криптостойких алгоритмов
 - Защита от padding oracle атак (AES-GCM)
@@ -50,14 +61,15 @@ MicroPKI — это профессиональный инструмент ком
 - Проверка соответствия ключа и сертификата
 - Верификация самоподписанных сертификатов
 - Валидация цепочек сертификатов согласно RFC 5280
+- Регистронезависимый поиск серийных номеров
+- Нормализация серийных номеров
 
 ### **Технические детали**
 - Написано на Go (стандартная библиотека + `github.com/mattn/go-sqlite3`)
-- SQLite для хранения сертификатов
+- SQLite для хранения сертификатов и метаданных CRL
 - HTTP сервер на стандартном `net/http`
-- Полное покрытие тестами
 - Кросс-платформенная компиляция (Linux, macOS, Windows)
-- OpenSSL совместимость
+- OpenSSL совместимость (CRL можно проверять через `openssl crl`)
 
 ## Быстрый старт
 
@@ -110,12 +122,22 @@ echo "MyIntermediatePass456" > intermediate-pass.txt
 # 7. Посмотрите все сертификаты в БД
 ./micropki-cli ca list-certs --db-path ./pki/micropki.db
 
-# 8. Запустите HTTP репозиторий
+# 8. Отзовите сертификат
+./micropki-cli ca revoke <серийный-номер> --reason keyCompromise
+
+# 9. Сгенерируйте CRL для промежуточного CA
+./micropki-cli ca gen-crl --ca intermediate --next-update 7
+
+# 10. Запустите HTTP репозиторий (обслуживает сертификаты и CRL)
 ./micropki-cli repo serve --host 127.0.0.1 --port 8080 --db-path ./pki/micropki.db
 
-# 9. В другом терминале получите сертификат через API
-curl http://127.0.0.1:8080/ca/root
-curl http://127.0.0.1:8080/certificate/<серийный-номер>
+# 11. Получите CRL через HTTP
+curl http://127.0.0.1:8080/crl -o intermediate.crl.pem
+curl http://127.0.0.1:8080/crl?ca=root -o root.crl.pem
+curl http://127.0.0.1:8080/crl/intermediate.crl -o intermediate.crl.pem
+
+# 12. Проверьте CRL с OpenSSL
+openssl crl -in ./pki/crl/intermediate.crl.pem -inform PEM -text -noout
 ```
 
 ## Установка
@@ -258,10 +280,79 @@ sudo make install  # опционально, установит в /usr/local/bi
   --root ./pki/root/certs/ca.cert.pem
 ```
 
+### Команды управления CRL
+
+#### `ca revoke <serial>`
+Отзыв сертификата по серийному номеру.
+
+```bash
+./micropki-cli ca revoke <serial> [параметры]
+```
+
+**Обязательные параметры:**
+
+| Параметр | Описание |
+|----------|----------|
+| `<serial>` | Серийный номер сертификата в hex формате |
+
+**Опциональные параметры:**
+
+| Параметр | Описание | По умолчанию |
+|----------|----------|--------------|
+| `--reason` | Причина отзыва (см. список ниже) | `unspecified` |
+| `--force` | Пропустить запрос подтверждения | `false` |
+| `--db-path` | Путь к базе данных | `./pki/micropki.db` |
+| `--out-dir` | Выходная директория (для CRL) | `./pki` |
+
+**Поддерживаемые причины отзыва:**
+- `unspecified` (0) - не указана
+- `keyCompromise` (1) - компрометация ключа
+- `cACompromise` (2) - компрометация CA
+- `affiliationChanged` (3) - изменение принадлежности
+- `superseded` (4) - замещён
+- `cessationOfOperation` (5) - прекращение деятельности
+- `certificateHold` (6) - временная приостановка
+- `removeFromCRL` (8) - удаление из CRL
+- `privilegeWithdrawn` (9) - отзыв привилегий
+- `aACompromise` (10) - компрометация AA
+
+#### `ca gen-crl`
+Генерация CRL для указанного CA.
+
+```bash
+./micropki-cli ca gen-crl [параметры]
+```
+
+**Обязательные параметры:**
+
+| Параметр | Описание |
+|----------|----------|
+| `--ca` | Имя CA: `root` или `intermediate` |
+
+**Опциональные параметры:**
+
+| Параметр | Описание | По умолчанию |
+|----------|----------|--------------|
+| `--next-update` | Количество дней до следующего обновления | `7` |
+| `--out-file` | Выходной файл для CRL | авто |
+| `--db-path` | Путь к базе данных | `./pki/micropki.db` |
+| `--out-dir` | Выходная директория | `./pki` |
+
+#### `ca check-revoked <serial>`
+Проверка статуса отзыва сертификата.
+
+```bash
+./micropki-cli ca check-revoked <serial> [параметры]
+```
+
+| Параметр | Описание | По умолчанию |
+|----------|----------|--------------|
+| `--db-path` | Путь к базе данных | `./pki/micropki.db` |
+
 ### Команды базы данных
 
 #### `db init`
-Инициализация базы данных SQLite.
+Инициализация базы данных SQLite (создаёт таблицы для сертификатов и CRL).
 
 ```bash
 ./micropki-cli db init [параметры]
@@ -275,7 +366,7 @@ sudo make install  # опционально, установит в /usr/local/bi
 ### Команды репозитория
 
 #### `repo serve`
-Запуск HTTP сервера репозитория.
+Запуск HTTP сервера репозитория (обслуживает сертификаты и CRL).
 
 ```bash
 ./micropki-cli repo serve [параметры]
@@ -299,7 +390,7 @@ sudo make install  # опционально, установит в /usr/local/bi
 
 ## Примеры
 
-### Пример 1: Полный рабочий процесс с БД и репозиторием
+### Пример 1: Полный рабочий процесс с CRL
 
 ```bash
 # 1. Инициализация БД
@@ -314,7 +405,7 @@ echo "rootpass" > root-pass.txt
   --passphrase-file root-pass.txt \
   --out-dir ./pki/root
 
-# 3. Создание Intermediate CA (с сохранением в БД)
+# 3. Создание Intermediate CA
 echo "intpass" > int-pass.txt
 ./micropki-cli ca issue-intermediate \
   --root-cert ./pki/root/certs/ca.cert.pem \
@@ -327,7 +418,7 @@ echo "intpass" > int-pass.txt
   --out-dir ./pki/intermediate \
   --db-path ./pki/micropki.db
 
-# 4. Выпуск нескольких сертификатов
+# 4. Выпуск сертификатов
 for i in {1..5}; do
   ./micropki-cli ca issue-cert \
     --ca-cert ./pki/intermediate/certs/intermediate.cert.pem \
@@ -340,53 +431,60 @@ for i in {1..5}; do
     --db-path ./pki/micropki.db
 done
 
-# 5. Просмотр всех сертификатов
-./micropki-cli ca list-certs --db-path ./pki/micropki.db --format table
+# 5. Отзыв сертификата (например, при компрометации)
+./micropki-cli ca revoke <серийный-номер> --reason keyCompromise
 
-# 6. Запуск репозитория
+# 6. Генерация CRL
+./micropki-cli ca gen-crl --ca intermediate --next-update 7
+
+# 7. Просмотр CRL
+openssl crl -in ./pki/crl/intermediate.crl.pem -inform PEM -text -noout
+
+# 8. Запуск репозитория
 ./micropki-cli repo serve --host 0.0.0.0 --port 8443 --db-path ./pki/micropki.db
 
-# 7. В другом терминале получение сертификата через API
-curl http://localhost:8443/ca/root
-curl http://localhost:8443/certificate/$(./micropki-cli ca list-certs --db-path ./pki/micropki.db --format json | jq -r '.[0].serial_hex')
+# 9. Получение CRL через HTTP
+curl http://localhost:8443/crl -o intermediate.crl
+curl http://localhost:8443/crl?ca=root -o root.crl
+curl http://localhost:8443/crl/intermediate.crl -o intermediate.crl
+
+# 10. Проверка статуса сертификата
+./micropki-cli ca check-revoked <серийный-номер>
 ```
 
-### Пример 2: Работа с JSON выводом
+### Пример 2: Все причины отзыва
+
+```bash
+# Отзыв с разными причинами
+./micropki-cli ca revoke <serial> --reason keyCompromise
+./micropki-cli ca revoke <serial> --reason cACompromise
+./micropki-cli ca revoke <serial> --reason affiliationChanged
+./micropki-cli ca revoke <serial> --reason superseded
+./micropki-cli ca revoke <serial> --reason cessationOfOperation
+./micropki-cli ca revoke <serial> --reason certificateHold
+./micropki-cli ca revoke <serial> --reason removeFromCRL
+./micropki-cli ca revoke <serial> --reason privilegeWithdrawn
+./micropki-cli ca revoke <serial> --reason aACompromise
+```
+
+### Пример 3: Работа с JSON выводом
 
 ```bash
 # Получить все сертификаты в JSON
-./micropki-cli ca list-certs --db-path ./pki/micropki.db --format json | jq '.[] | {serial: .serial_hex, subject: .subject}'
+./micropki-cli ca list-certs --db-path ./pki/micropki.db --format json | jq '.[] | {serial: .serial_hex, subject: .subject, status: .status}'
 
-# Фильтрация через jq
-./micropki-cli ca list-certs --db-path ./pki/micropki.db --format json | jq '.[] | select(.status=="valid")'
-
-# Подсчет сертификатов
-./micropki-cli ca list-certs --db-path ./pki/micropki.db --format json | jq length
+# Фильтрация отозванных сертификатов
+./micropki-cli ca list-certs --db-path ./pki/micropki.db --format json | jq '.[] | select(.status=="revoked")'
 ```
 
-### Пример 3: Экспорт в CSV
+### Пример 4: Интеграция с OpenSSL
 
 ```bash
-# Экспорт всех сертификатов в CSV файл
-./micropki-cli ca list-certs --db-path ./pki/micropki.db --format csv > certificates.csv
+# Проверка подписи CRL
+openssl crl -in ./pki/crl/intermediate.crl.pem -inform PEM -CAfile ./pki/intermediate/certs/intermediate.cert.pem -noout
 
-# Импорт в электронную таблицу или анализ
-cat certificates.csv | column -t -s, | less
-```
-
-### Пример 4: Интеграция с мониторингом
-
-```bash
-# Проверка здоровья репозитория
-if curl -s http://localhost:8080/health | grep -q "ok"; then
-  echo "Репозиторий работает"
-else
-  echo "Репозиторий не отвечает"
-fi
-
-# Получение количества сертификатов
-COUNT=$(./micropki-cli ca list-certs --db-path ./pki/micropki.db --format json | jq length)
-echo "Всего сертификатов: $COUNT"
+# Просмотр содержимого CRL
+openssl crl -in ./pki/crl/intermediate.crl.pem -inform PEM -text -noout
 ```
 
 ## Структура проекта
@@ -402,6 +500,7 @@ micropki/
 │       ├── certs/                  # X.509 операции
 │       ├── chain/                  # Проверка цепочек сертификатов
 │       ├── config/                 # Конфигурация (YAML/JSON)
+│       ├── crl/                    # CRL генерация и управление отзывом
 │       ├── crypto/                 # Криптография
 │       ├── csr/                    # Обработка CSR
 │       ├── database/               # SQLite база данных
@@ -420,6 +519,9 @@ micropki/
 ```
 pki/
 ├── micropki.db                       # База данных SQLite
+├── crl/                              # CRL файлы
+│   ├── root.crl.pem                  # CRL корневого CA
+│   └── intermediate.crl.pem          # CRL промежуточного CA
 ├── root/
 │   ├── private/
 │   │   └── ca.key.pem                # Зашифрованный ключ Root CA (0600)
@@ -448,7 +550,8 @@ pki/
 | GET | `/certificate/<serial>` | Получение сертификата по серийному номеру | 200, 400, 404 |
 | GET | `/ca/root` | Получение корневого CA сертификата | 200, 404 |
 | GET | `/ca/intermediate` | Получение промежуточного CA сертификата | 200, 404 |
-| GET | `/crl` | Заглушка для CRL (Sprint 4) | 501 |
+| GET | `/crl` | Получение CRL | 200, 400, 404 |
+| GET | `/crl/<filename>` | Получение CRL по имени файла | 200, 400, 404 |
 
 ### Примеры запросов
 
@@ -463,10 +566,24 @@ curl http://localhost:8080/ca/root -o root.pem
 # Получение сертификата по серийному номеру
 curl http://localhost:8080/certificate/1d7a6df2dc963c57a6a57530251bd819c00d2d6a -o cert.pem
 
-# Проверка CRL (заглушка)
-curl -v http://localhost:8080/crl
-< HTTP/1.1 501 Not Implemented
-CRL generation not yet implemented (Sprint 4)
+# Получение CRL (разные способы)
+curl http://localhost:8080/crl -o intermediate.crl
+curl http://localhost:8080/crl?ca=root -o root.crl
+curl http://localhost:8080/crl/intermediate.crl -o intermediate.crl
+
+# Проверка заголовков CRL
+curl -I http://localhost:8080/crl
+```
+
+### Заголовки ответа для CRL
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/pkix-crl
+Content-Disposition: attachment; filename="intermediate.crl.pem"
+Last-Modified: Thu, 12 Mar 2026 10:30:00 GMT
+ETag: "1535-1678602600"
+Cache-Control: public, max-age=3600, must-revalidate
 ```
 
 ## Безопасность
@@ -480,15 +597,25 @@ CRL generation not yet implemented (Sprint 4)
 | **Шифрование ключей CA** | AES-256-GCM | Аутентифицированное шифрование |
 | **Ключи конечных субъектов** | Незашифрованные | Для совместимости |
 | **Производные ключи** | PBKDF2, 600,000 итераций | OWASP рекомендации |
-| **Серийные номера** | 64-бит composite + БД | Глобальная уникальность |
+| **Серийные номера** | 160 бит энтропии | Глобальная уникальность |
+| **CRL подписи** | Те же алгоритмы, что и у CA | Соответствие RFC 5280 |
+
+### Меры безопасности при отзыве
+
+1. **Подтверждение операции** - запрос подтверждения перед отзывом
+2. **Проверка существования** - сертификат должен существовать в БД
+3. **Защита от повторного отзыва** - предупреждение при попытке отозвать уже отозванный
+4. **Аудит** - все операции отзыва логируются
+5. **Монотонные номера CRL** - защита от подмены старыми CRL
 
 ### Рекомендации по эксплуатации
 
 1. **Регулярное резервное копирование** БД и директорий `private/`
-2. **Мониторинг** через `/health` эндпоинт
-3. **Ограничение доступа** к порту репозитория (8443) через firewall
-4. **Аудит** через `ca list-certs` и логи HTTP сервера
-5. **Тестирование уникальности** серийных номеров через `make test-serial-uniqueness`
+2. **Регулярная генерация CRL** - настроить cron для `ca gen-crl`
+3. **Мониторинг** через `/health` эндпоинт
+4. **Ограничение доступа** к порту репозитория через firewall
+5. **Аудит** через `ca list-certs --status revoked` и логи HTTP сервера
+6. **Тестирование** - регулярно запускать `make test-crl-lifecycle`
 
 ## Тестирование
 
@@ -504,14 +631,22 @@ make test-db
 # Тестирование репозитория
 make test-repo
 
-# Тестирование генератора серийных номеров
-make test-serial
+# Тестирование CRL функционала
+make test-crl-unit
+make test-crl-integration
 
-# Интеграционные тесты Спринта 3
-make test-integration-sprint3
+# Тест жизненного цикла CRL
+make test-crl-lifecycle
+
+# Полное тестирование CRL
+make test-crl-benchmark
+make test-sprint4-full
 
 # Тест уникальности серийных номеров (100 сертификатов)
 make test-serial-uniqueness
+
+# Все тесты
+make test-all
 
 # С покрытием
 make test-coverage
@@ -531,6 +666,19 @@ make test-coverage
 | `make fmt` | Отформатировать код |
 | `make vet` | Запустить статический анализ |
 
+### Цели для работы с CRL
+
+| Команда | Описание |
+|---------|----------|
+| `make crl-revoke` | Интерактивный отзыв сертификата |
+| `make crl-gen` | Генерация Intermediate CRL |
+| `make crl-gen-root` | Генерация Root CRL |
+| `make crl-check` | Проверка статуса сертификата |
+| `make crl-verify` | Просмотр CRL через OpenSSL |
+| `make crl-verify-signature` | Проверка подписи CRL |
+| `make test-crl-lifecycle` | Тест жизненного цикла CRL |
+| `make test-crl-http` | Тест HTTP CRL эндпоинтов |
+
 ### Цели для работы с БД и репозиторием
 
 | Команда | Описание |
@@ -542,17 +690,6 @@ make test-coverage
 | `make repo-stop` | Остановка HTTP сервера |
 | `make repo-status` | Проверка статуса сервера |
 | `make test-api` | Тестирование API эндпоинтов |
-
-### Цели для тестирования Спринта 3
-
-| Команда | Описание |
-|---------|----------|
-| `make test-db` | Тестирование базы данных |
-| `make test-repo` | Тестирование репозитория |
-| `make test-serial` | Тестирование генератора серийных номеров |
-| `make test-serial-uniqueness` | Тест уникальности 100 серийных номеров |
-| `make test-integration-sprint3` | Полные интеграционные тесты |
-| `make example-full` | Создание полной PKI иерархии с БД |
 
 ### Пример полного цикла разработки
 
@@ -569,15 +706,14 @@ make db-init
 # 4. Создание полной PKI иерархии
 make example-full
 
-# 5. Запуск репозитория
+# 5. Тестирование CRL
+make test-crl-lifecycle
+
+# 6. Запуск репозитория
 make repo-serve
 # (в другом терминале)
 make repo-status
-make test-api
-
-# 6. Тестирование
-make test-serial-uniqueness
-make test-integration-sprint3
+make test-crl-http
 
 # 7. Остановка
 make repo-stop
@@ -597,3 +733,4 @@ make clean
 - [Спринт 1](docs/sprints/sprint1.md) - Базовая структура и генерация ключей
 - [Спринт 2](docs/sprints/sprint2.md) - Расширенные возможности CA
 - [Спринт 3](docs/sprints/sprint3.md) - База данных и HTTP репозиторий
+- [Спринт 4](docs/sprints/sprint4.md) - CRL (Certificate Revocation List)

@@ -20,24 +20,39 @@ import (
 	"fmt"
 	"log"
 	"micropki/micropki/internal/database"
+	"strings"
 )
 
 // InsertCertificateIntoDB вставляет сертификат в базу данных.
 // Эта функция вызывается из команд выпуска сертификатов.
 func InsertCertificateIntoDB(dbPath string, cert *x509.Certificate, certPEM []byte, logger *log.Logger) error {
-	// Открываем БД
 	db, err := database.New(dbPath)
 	if err != nil {
 		return fmt.Errorf("не удалось открыть БД: %w", err)
 	}
 	defer db.Close()
 
-	// Инициализируем схему (если еще не создана)
 	if err := db.InitSchema(); err != nil {
 		return fmt.Errorf("не удалось инициализировать схему БД: %w", err)
 	}
 
-	// Создаем запись
+	var exists int
+	err = db.QueryRow("SELECT COUNT(*) FROM certificates WHERE serial_hex = ?",
+		hex.EncodeToString(cert.SerialNumber.Bytes())).Scan(&exists)
+	if err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+		} else {
+			return fmt.Errorf("ошибка при проверке существования сертификата: %w", err)
+		}
+	}
+
+	if exists > 0 {
+		if logger != nil {
+			logger.Printf("INFO: Сертификат %X уже существует в БД, пропускаем вставку", cert.SerialNumber)
+		}
+		return nil
+	}
+
 	record := &database.CertificateRecord{
 		SerialHex: hex.EncodeToString(cert.SerialNumber.Bytes()),
 		Subject:   cert.Subject.String(),
@@ -48,7 +63,6 @@ func InsertCertificateIntoDB(dbPath string, cert *x509.Certificate, certPEM []by
 		Status:    "valid",
 	}
 
-	// Вставляем в БД
 	if err := db.InsertCertificate(record); err != nil {
 		return fmt.Errorf("не удалось вставить сертификат в БД: %w", err)
 	}
