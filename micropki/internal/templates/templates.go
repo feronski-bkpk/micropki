@@ -14,6 +14,7 @@ package templates
 import (
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"fmt"
 	"net"
 	"net/url"
@@ -372,4 +373,53 @@ func splitSANs(sans []SAN) (dnsNames []string, ipAddresses []net.IP, emailAddres
 		}
 	}
 	return dnsNames, ipAddresses, emailAddresses, uris
+}
+
+// OCSP - шаблон для OCSP responder сертификата
+const OCSP TemplateType = "ocsp"
+
+// NewOCSPResponderTemplate создаёт шаблон для OCSP responder сертификата.
+// Реализует требования OSC-1:
+//   - Basic Constraints: CA=FALSE (критическое)
+//   - Key Usage: digitalSignature (критическое)
+//   - Extended Key Usage: id-kp-OCSPSigning (1.3.6.1.5.5.7.3.9)
+//   - Subject Alternative Name: опционально, DNS или URI где размещён responder
+//
+// Параметры:
+//   - cfg: конфигурация шаблона
+//
+// Возвращает:
+//   - *x509.Certificate: готовый шаблон сертификата
+//   - error: ошибку, если конфигурация невалидна
+func NewOCSPResponderTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
+	dnsNames, ipAddresses, emailAddresses, uris := splitSANs(cfg.SANs)
+
+	for _, san := range cfg.SANs {
+		if san.Type != "dns" && san.Type != "uri" {
+			return nil, fmt.Errorf("OCSP responder сертификат может содержать только DNS или URI SAN")
+		}
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: cfg.SerialNumber.BigInt(),
+		Subject:      *cfg.Subject,
+		NotBefore:    cfg.NotBefore,
+		NotAfter:     cfg.NotAfter,
+
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+
+		KeyUsage: x509.KeyUsageDigitalSignature,
+
+		UnknownExtKeyUsage: []asn1.ObjectIdentifier{
+			{1, 3, 6, 1, 5, 5, 7, 3, 9},
+		},
+
+		DNSNames:       dnsNames,
+		IPAddresses:    ipAddresses,
+		EmailAddresses: emailAddresses,
+		URIs:           uris,
+	}
+
+	return template, nil
 }

@@ -152,9 +152,6 @@ func issueTestCertificate(t *testing.T, baseDir, name string) string {
 	dbPath := baseDir + "/micropki.db"
 	certDir := baseDir + "/certs"
 
-	t.Logf("DEBUG: Issuing certificate with DB: %s", dbPath)
-	t.Logf("DEBUG: Certificate directory: %s", certDir)
-
 	os.RemoveAll(certDir)
 	os.MkdirAll(certDir, 0755)
 
@@ -174,6 +171,7 @@ func issueTestCertificate(t *testing.T, baseDir, name string) string {
 
 	t.Logf("CLI output: %s", output)
 
+	// Извлекаем серийный номер из вывода
 	lines := strings.Split(output, "\n")
 	var serial string
 	for _, line := range lines {
@@ -190,6 +188,7 @@ func issueTestCertificate(t *testing.T, baseDir, name string) string {
 		t.Fatal("Could not extract serial number from output")
 	}
 
+	// Проверяем наличие файлов сертификатов
 	files, err := filepath.Glob(certDir + "/*.cert.pem")
 	if err != nil || len(files) == 0 {
 		t.Logf("WARNING: No certificate files found in %s", certDir)
@@ -197,46 +196,61 @@ func issueTestCertificate(t *testing.T, baseDir, name string) string {
 		t.Logf("Certificate files: %v", files)
 	}
 
+	// Даём время на запись в БД
 	time.Sleep(1 * time.Second)
 
+	// Проверяем, что сертификат добавлен в БД
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		t.Logf("Could not open DB for verification: %v", err)
-	} else {
-		defer db.Close()
+		return serial
+	}
+	defer db.Close()
 
-		rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='table'")
+	// Для диагностики показываем таблицы в БД
+	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='table'")
+	if err == nil {
+		defer rows.Close()
+		tables := []string{}
+		for rows.Next() {
+			var name string
+			rows.Scan(&name)
+			tables = append(tables, name)
+		}
+		t.Logf("Tables in DB: %v", tables)
+	}
+
+	// Проверяем наличие сертификата в БД
+	var count int
+	normalizedSerial := strings.ToLower(serial)
+	err = db.QueryRow("SELECT COUNT(*) FROM certificates WHERE LOWER(serial_hex) = ?", normalizedSerial).Scan(&count)
+	if err != nil {
+		t.Logf("WARNING: Could not verify certificate in DB: %v", err)
+	} else if count == 0 {
+		// Сертификат не найден - показываем все сертификаты для диагностики
+		t.Logf("WARNING: Certificate %s not immediately found in DB, checking all certificates...", serial)
+
+		rows, err := db.Query("SELECT serial_hex, subject FROM certificates")
 		if err == nil {
 			defer rows.Close()
-			tables := []string{}
+			found := false
+			t.Log("Certificates in DB:")
 			for rows.Next() {
-				var name string
-				rows.Scan(&name)
-				tables = append(tables, name)
-			}
-			t.Logf("Tables in DB: %v", tables)
-		}
-
-		var count int
-		err = db.QueryRow("SELECT COUNT(*) FROM certificates WHERE serial_hex = ?", serial).Scan(&count)
-		if err != nil {
-			t.Logf("ERROR: Could not verify certificate in DB: %v", err)
-		} else if count == 0 {
-			t.Logf("ERROR: Certificate %s NOT found in DB after issuance!", serial)
-
-			rows, err := db.Query("SELECT serial_hex, subject FROM certificates")
-			if err == nil {
-				defer rows.Close()
-				t.Log("Certificates in DB:")
-				for rows.Next() {
-					var s, subj string
-					rows.Scan(&s, &subj)
-					t.Logf("  %s: %s", s, subj)
+				var s, subj string
+				rows.Scan(&s, &subj)
+				t.Logf("  %s: %s", s, subj)
+				if strings.EqualFold(s, serial) {
+					found = true
 				}
 			}
-		} else {
-			t.Logf("✓ Certificate %s verified in DB", serial)
+			if found {
+				t.Logf("✓ Certificate %s found in DB (case-insensitive match)", serial)
+			} else {
+				t.Logf("WARNING: Certificate %s NOT found in DB after issuance!", serial)
+			}
 		}
+	} else {
+		t.Logf("✓ Certificate %s verified in DB", serial)
 	}
 
 	return serial
@@ -318,7 +332,6 @@ func TestCLIRevoke(t *testing.T) {
 	}
 
 	dbPath := testDir + "/micropki.db"
-	t.Logf("DEBUG: Using database: %s", dbPath)
 
 	serial := issueTestCertificate(t, testDir, "test.example.com")
 	t.Logf("Issued certificate with serial: %s", serial)

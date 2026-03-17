@@ -3,8 +3,13 @@
 package database
 
 import (
+	"crypto/x509"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"math/big"
+	"micropki/micropki/internal/certs"
+	"micropki/micropki/internal/ocsp"
 	"os"
 	"path/filepath"
 	"strings"
@@ -518,4 +523,109 @@ func (db *DB) Close() error {
 // Path возвращает путь к файлу базы данных.
 func (db *DB) Path() string {
 	return db.path
+}
+
+// GetCertificateStatusForOCSP возвращает статус сертификата для OCSP
+func (db *DB) GetCertificateStatusForOCSP(issuerNameHash, issuerKeyHash []byte, serial *big.Int) (*ocsp.StatusResult, error) {
+	serialHex := hex.EncodeToString(serial.Bytes())
+
+	var status string
+	var revocationReason sql.NullString
+	var revocationDate sql.NullString
+	var issuer string
+
+	err := db.QueryRow(
+		`SELECT status, revocation_reason, revocation_date, issuer 
+		 FROM certificates 
+		 WHERE serial_hex = ?`,
+		serialHex,
+	).Scan(&status, &revocationReason, &revocationDate, &issuer)
+
+	if err == sql.ErrNoRows {
+		return &ocsp.StatusResult{
+			Status:     ocsp.StatusUnknown,
+			ThisUpdate: time.Now().UTC(),
+		}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ошибка при запросе статуса: %w", err)
+	}
+
+	switch status {
+	case "valid":
+		return &ocsp.StatusResult{
+			Status:     ocsp.StatusGood,
+			ThisUpdate: time.Now().UTC(),
+		}, nil
+
+	case "revoked":
+		var revTime time.Time
+		if revocationDate.Valid {
+			revTime, _ = time.Parse(time.RFC3339, revocationDate.String)
+		} else {
+			revTime = time.Now().UTC()
+		}
+
+		var reason *int
+		if revocationReason.Valid && revocationReason.String != "" {
+		}
+
+		return &ocsp.StatusResult{
+			Status:           ocsp.StatusRevoked,
+			RevocationTime:   &revTime,
+			RevocationReason: reason,
+			ThisUpdate:       time.Now().UTC(),
+		}, nil
+
+	default:
+		return &ocsp.StatusResult{
+			Status:     ocsp.StatusUnknown,
+			ThisUpdate: time.Now().UTC(),
+		}, nil
+	}
+}
+
+// GetIssuerByHashes возвращает сертификат издателя по хешам
+func (db *DB) GetIssuerByHashes(nameHash, keyHash []byte) (*x509.Certificate, error) {
+	intPath := filepath.Join(filepath.Dir(db.path), "intermediate", "certs", "intermediate.cert.pem")
+	if cert, err := certs.LoadCertificate(intPath); err == nil {
+		if match, _ := ocsp.VerifyCertID(&ocsp.CertID{
+			IssuerNameHash: nameHash,
+			IssuerKeyHash:  keyHash,
+		}, cert); match {
+			return cert, nil
+		}
+	}
+
+	rootPath := filepath.Join(filepath.Dir(db.path), "root", "certs", "ca.cert.pem")
+	if cert, err := certs.LoadCertificate(rootPath); err == nil {
+		if match, _ := ocsp.VerifyCertID(&ocsp.CertID{
+			IssuerNameHash: nameHash,
+			IssuerKeyHash:  keyHash,
+		}, cert); match {
+			return cert, nil
+		}
+	}
+
+	return nil, fmt.Errorf("издатель не найден")
+}
+
+// DatabaseStatusChecker реализует интерфейс ocsp.StatusChecker
+type DatabaseStatusChecker struct {
+	db *DB
+}
+
+// NewDatabaseStatusChecker создаёт новый проверяльщик статуса
+func (db *DB) NewDatabaseStatusChecker() *DatabaseStatusChecker {
+	return &DatabaseStatusChecker{db: db}
+}
+
+// GetCertificateStatus реализует интерфейс ocsp.StatusChecker
+func (c *DatabaseStatusChecker) GetCertificateStatus(issuerNameHash, issuerKeyHash []byte, serial *big.Int) (*ocsp.StatusResult, error) {
+	return c.db.GetCertificateStatusForOCSP(issuerNameHash, issuerKeyHash, serial)
+}
+
+// GetIssuerByHashes реализует интерфейс ocsp.StatusChecker
+func (c *DatabaseStatusChecker) GetIssuerByHashes(nameHash, keyHash []byte) (*x509.Certificate, error) {
+	return c.db.GetIssuerByHashes(nameHash, keyHash)
 }

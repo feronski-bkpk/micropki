@@ -6,6 +6,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	stdcrypto "crypto"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -32,6 +34,7 @@ import (
 	"micropki/micropki/internal/crl"
 	"micropki/micropki/internal/crypto"
 	"micropki/micropki/internal/database"
+	"micropki/micropki/internal/ocsp"
 	"micropki/micropki/internal/repository"
 	"micropki/micropki/internal/serial"
 	"micropki/micropki/internal/templates"
@@ -98,6 +101,8 @@ func run(args []string, logger *log.Logger) error {
 			return runCAIssueIntermediate(args[2:], logger)
 		case "issue-cert":
 			return runCAIssueCert(args[2:], logger)
+		case "issue-ocsp-cert":
+			return runCAIssueOCSPCert(args[2:], logger)
 		case "verify":
 			return runCAVerify(args[2:], logger)
 		case "verify-chain":
@@ -137,6 +142,16 @@ func run(args []string, logger *log.Logger) error {
 		default:
 			return fmt.Errorf("неизвестная подкоманда '%s' для 'repo'", args[1])
 		}
+	case "ocsp":
+		if len(args) < 2 {
+			return fmt.Errorf("отсутствует подкоманда для 'ocsp'\nИспользование: micropki-cli ocsp <подкоманда> [опции]")
+		}
+		switch args[1] {
+		case "serve":
+			return runOCSPServe(args[2:], logger)
+		default:
+			return fmt.Errorf("неизвестная подкоманда '%s' для 'ocsp'", args[1])
+		}
 	case "help", "--help", "-h":
 		printUsage()
 		return nil
@@ -148,13 +163,14 @@ func run(args []string, logger *log.Logger) error {
 // printUsage выводит подробную справку по использованию программы,
 // включая все доступные команды, подкоманды и их опции.
 func printUsage() {
-	fmt.Println("MicroPKI - Минимальная инфраструктура открытых ключей (Спринт 4 - CRL)")
+	fmt.Println("MicroPKI - Минимальная инфраструктура открытых ключей")
 	fmt.Println("\nИспользование: micropki-cli <команда> [подкоманда] [опции]")
 
 	fmt.Println("\nКоманды CA (центры сертификации):")
 	fmt.Println("  ca init                 Инициализация нового корневого CA")
 	fmt.Println("  ca issue-intermediate   Создание промежуточного CA, подписанного корневым CA")
 	fmt.Println("  ca issue-cert           Выпуск конечного сертификата от промежуточного CA")
+	fmt.Println("  ca issue-ocsp-cert      Выпуск сертификата для OCSP-ответчика")
 	fmt.Println("  ca verify               Проверка сертификата")
 	fmt.Println("  ca verify-chain         Проверка полной цепочки сертификатов")
 	fmt.Println("  ca list-certs           Список всех сертификатов в базе данных")
@@ -169,6 +185,9 @@ func printUsage() {
 	fmt.Println("\nКоманды Репозитория (HTTP сервер):")
 	fmt.Println("  repo serve              Запуск HTTP сервера репозитория")
 	fmt.Println("  repo status             Проверка статуса сервера репозитория")
+
+	fmt.Println("\nКоманды OCSP (Online Certificate Status Protocol):")
+	fmt.Println("  ocsp serve              Запуск OCSP-ответчика")
 
 	fmt.Println("\nОбщие команды:")
 	fmt.Println("  help                    Показать эту справку")
@@ -210,6 +229,18 @@ func printUsage() {
 	fmt.Println("  --validity-days     Срок действия конечного сертификата (по умолчанию: 365)")
 	fmt.Println("  --key-type          Тип ключа для внутренней генерации: rsa или ecc (по умолчанию: rsa)")
 	fmt.Println("  --key-size          Размер ключа для внутренней генерации (по умолчанию: 2048 для RSA, 256 для ECC)")
+	fmt.Println("  --db-path           Путь к базе данных SQLite (для автоматической вставки)")
+
+	fmt.Println("\nОпции для CA Issue-OCSP-Cert:")
+	fmt.Println("  --ca-cert           Сертификат промежуточного CA (PEM) (обязательно)")
+	fmt.Println("  --ca-key            Зашифрованный закрытый ключ CA (PEM) (обязательно)")
+	fmt.Println("  --ca-pass-file      Парольная фраза для ключа CA (обязательно)")
+	fmt.Println("  --subject           Различающееся имя для OCSP-сертификата (обязательно)")
+	fmt.Println("  --san               Альтернативные имена субъекта (dns:... или uri:...)")
+	fmt.Println("  --key-type          Тип ключа: rsa или ecc (по умолчанию: rsa)")
+	fmt.Println("  --key-size          Размер ключа (RSA: 2048/4096, ECC: 256/384)")
+	fmt.Println("  --out-dir           Выходная директория (по умолчанию: ./pki/certs)")
+	fmt.Println("  --validity-days     Срок действия в днях (по умолчанию: 365)")
 	fmt.Println("  --db-path           Путь к базе данных SQLite (для автоматической вставки)")
 
 	fmt.Println("\nОпции для CA Revoke:")
@@ -254,9 +285,21 @@ func printUsage() {
 	fmt.Println("  --cert-dir          Директория с сертификатами CA (по умолчанию: ./pki/certs)")
 	fmt.Println("  --log-file          Файл для логов HTTP сервера")
 	fmt.Println("  --config            Путь к конфигурационному файлу (YAML/JSON)")
+	fmt.Println("  --enable-ocsp       Опционально: включить OCSP-эндпоинт на /ocsp")
+	fmt.Println("  --ocsp-port         Порт для OCSP-ответчика (если отдельный процесс)")
 
 	fmt.Println("\nОпции для Repo Status:")
 	fmt.Println("  --port              Порт для проверки (по умолчанию: 8080)")
+
+	fmt.Println("\nОпции для OCSP Serve:")
+	fmt.Println("  --host              Адрес для прослушивания (по умолчанию: 127.0.0.1)")
+	fmt.Println("  --port              Порт (по умолчанию: 8081)")
+	fmt.Println("  --db-path           Путь к базе данных SQLite (по умолчанию: ./pki/micropki.db)")
+	fmt.Println("  --responder-cert    Путь к сертификату OCSP-ответчика (PEM) (обязательно)")
+	fmt.Println("  --responder-key     Путь к ключу OCSP-ответчика (PEM, незашифрованный) (обязательно)")
+	fmt.Println("  --ca-cert           Путь к сертификату издателя (PEM) (обязательно)")
+	fmt.Println("  --cache-ttl         Время жизни кэша в секундах (по умолчанию: 60)")
+	fmt.Println("  --log-file          Файл для логов OCSP сервера")
 }
 
 // ============================================================================
@@ -884,10 +927,6 @@ func printCertText(record *database.CertificateRecord) {
 
 // generateCRLForCA генерирует CRL для указанного CA.
 func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger *log.Logger) error {
-	logger.Printf("CRL GEN: ===== НАЧАЛО ГЕНЕРАЦИИ CRL для CA '%s' =====", caName)
-	logger.Printf("CRL GEN: Путь к БД: %s", dbPath)
-	logger.Printf("CRL GEN: Выходная директория: %s", outDir)
-
 	db, err := database.New(dbPath)
 	if err != nil {
 		return fmt.Errorf("не удалось подключиться к БД: %w", err)
@@ -909,10 +948,6 @@ func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger 
 		return fmt.Errorf("неизвестное имя CA: %s", caName)
 	}
 
-	logger.Printf("CRL GEN: Путь к сертификату CA: %s", certPath)
-	logger.Printf("CRL GEN: Путь к ключу CA: %s", keyPath)
-	logger.Printf("CRL GEN: Путь к файлу с паролем: %s", passFile)
-
 	if _, err := os.Stat(certPath); err != nil {
 		logger.Printf("ERROR: Сертификат CA не найден: %v", err)
 		return fmt.Errorf("сертификат CA не найден: %w", err)
@@ -926,7 +961,6 @@ func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger 
 	if err != nil {
 		return fmt.Errorf("не удалось загрузить сертификат CA: %w", err)
 	}
-	logger.Printf("CRL GEN: Сертификат CA загружен: %s", caCert.Subject)
 
 	passphrase, err := readPassphraseFromFile(passFile)
 	if err != nil {
@@ -939,68 +973,48 @@ func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger 
 	if err != nil {
 		return fmt.Errorf("не удалось загрузить закрытый ключ CA: %w", err)
 	}
-	logger.Printf("CRL GEN: Ключ CA загружен")
 
 	issuerDN := caCert.Subject.String()
-	logger.Printf("CRL GEN: Издатель: '%s'", issuerDN)
 
 	var totalCount int
 	err = db.QueryRow("SELECT COUNT(*) FROM certificates").Scan(&totalCount)
 	if err != nil {
 		logger.Printf("CRL GEN: Ошибка при подсчете всех сертификатов: %v", err)
-	} else {
-		logger.Printf("CRL GEN: Всего сертификатов в БД: %d", totalCount)
 	}
 
 	var revokedTotal int
 	err = db.QueryRow("SELECT COUNT(*) FROM certificates WHERE status = 'revoked'").Scan(&revokedTotal)
 	if err != nil {
 		logger.Printf("CRL GEN: Ошибка при подсчете всех отозванных: %v", err)
-	} else {
-		logger.Printf("CRL GEN: Всего отозванных сертификатов в БД: %d", revokedTotal)
 	}
 
 	var revokedForIssuer int
 	err = db.QueryRow("SELECT COUNT(*) FROM certificates WHERE status = 'revoked' AND issuer = ?", issuerDN).Scan(&revokedForIssuer)
 	if err != nil {
 		logger.Printf("CRL GEN: Ошибка при подсчете отозванных для издателя: %v", err)
-	} else {
-		logger.Printf("CRL GEN: Отозванных сертификатов для издателя '%s': %d", issuerDN, revokedForIssuer)
 	}
 
-	logger.Printf("CRL GEN: Вызываем GetRevokedCertificatesForIssuer для издателя %s", issuerDN)
 	revokedRecords, err := db.GetRevokedCertificatesForIssuer(issuerDN)
 	if err != nil {
 		return fmt.Errorf("не удалось получить отозванные сертификаты: %w", err)
 	}
-	logger.Printf("CRL GEN: GetRevokedCertificatesForIssuer вернула %d записей", len(revokedRecords))
 
 	if len(revokedRecords) == 0 && revokedTotal > 0 {
-		logger.Printf("CRL GEN: ВНИМАНИЕ! GetRevokedCertificatesForIssuer вернула 0, но в БД есть %d отозванных", revokedTotal)
 
 		allRevoked, err := db.GetRevokedCertificates()
 		if err != nil {
-			logger.Printf("CRL GEN: Ошибка при получении всех отозванных: %v", err)
 		} else {
-			logger.Printf("CRL GEN: Всего отозванных сертификатов в БД: %d", len(allRevoked))
-			for i, rec := range allRevoked {
-				logger.Printf("CRL GEN: Отозванный сертификат %d: %s, издатель: %s",
-					i, rec.SerialHex, rec.Issuer)
-			}
 
 			for _, rec := range allRevoked {
 				if rec.Issuer == issuerDN {
-					logger.Printf("CRL GEN: Найден отозванный сертификат для нашего издателя: %s", rec.SerialHex)
 					revokedRecords = append(revokedRecords, rec)
 				}
 			}
-			logger.Printf("CRL GEN: После ручной фильтрации: %d записей", len(revokedRecords))
 		}
 	}
 
 	revokedCerts := make([]crl.RevokedCertificate, 0, len(revokedRecords))
 	for _, record := range revokedRecords {
-		logger.Printf("CRL GEN: Обработка отозванного сертификата: %s", record.SerialHex)
 
 		serialBytes, err := hex.DecodeString(record.SerialHex)
 		if err != nil {
@@ -1017,14 +1031,11 @@ func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger 
 			reason, err := crl.ParseReasonCode(record.RevocationReason.String)
 			if err == nil {
 				rc.ReasonCode = &reason
-				logger.Printf("CRL GEN: Причина отзыва: %s", reason)
 			}
 		}
 
 		revokedCerts = append(revokedCerts, rc)
 	}
-
-	logger.Printf("CRL GEN: После обработки подготовлено %d сертификатов для CRL", len(revokedCerts))
 
 	crlStorage := crl.NewCRLStorage(db.DB)
 	if err := crlStorage.InitCRLTable(); err != nil {
@@ -1035,7 +1046,6 @@ func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger 
 	if err != nil {
 		return fmt.Errorf("не удалось получить номер CRL: %w", err)
 	}
-	logger.Printf("CRL GEN: Текущий номер CRL: %d", crlNumber)
 
 	newNumber, err := crlStorage.IncrementCRLNumber(issuerDN)
 	if err != nil {
@@ -1043,7 +1053,6 @@ func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger 
 	}
 
 	crlNumber = newNumber
-	logger.Printf("CRL GEN: Новый номер CRL: %d", crlNumber)
 
 	thisUpdate := time.Now().UTC()
 	nextUpdate := thisUpdate.AddDate(0, 0, nextUpdateDays)
@@ -1058,14 +1067,12 @@ func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger 
 		IncludeReasonExtensions: true,
 	}
 
-	logger.Printf("CRL GEN: Генерация CRL с %d отозванными сертификатами", len(revokedCerts))
 	crlObj, err := crl.GenerateCRL(cfg)
 	if err != nil {
 		return fmt.Errorf("не удалось сгенерировать CRL: %w", err)
 	}
 
 	savePath := filepath.Join(outDir, "crl", caName+".crl.pem")
-	logger.Printf("CRL GEN: Сохранение CRL в %s", savePath)
 
 	if err := os.MkdirAll(filepath.Dir(savePath), 0755); err != nil {
 		return fmt.Errorf("не удалось создать директорию: %w", err)
@@ -1077,9 +1084,6 @@ func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger 
 
 	if _, err := os.Stat(savePath); err != nil {
 		logger.Printf("ERROR: Файл CRL не создан: %v", err)
-	} else {
-		fileInfo, _ := os.Stat(savePath)
-		logger.Printf("CRL GEN: Файл CRL создан, размер: %d байт", fileInfo.Size())
 	}
 
 	info := &crl.CRLInfo{
@@ -1095,10 +1099,6 @@ func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger 
 	if err := crlStorage.UpdateCRLInfo(info); err != nil {
 		logger.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось обновить метаданные CRL: %v", err)
 	}
-
-	logger.Printf("CRL GEN: CRL успешно сгенерирован: %s", savePath)
-	logger.Printf("CRL GEN: Номер CRL: %d, отозванных сертификатов в CRL: %d", crlNumber, len(revokedCerts))
-	logger.Printf("CRL GEN: ===== КОНЕЦ ГЕНЕРАЦИИ CRL =====")
 
 	fmt.Printf("\n✓ CRL для CA '%s' сгенерирован:\n", caName)
 	fmt.Printf("  Файл: %s\n", savePath)
@@ -1860,4 +1860,244 @@ func sanitizeFilename(name string) string {
 		}
 	}
 	return string(result)
+}
+
+// runOCSPServe обрабатывает подкоманду 'ocsp serve'
+func runOCSPServe(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("ocsp-serve", flag.ContinueOnError)
+
+	var (
+		host          string
+		port          int
+		dbPath        string
+		responderCert string
+		responderKey  string
+		caCert        string
+		cacheTTL      int
+		logFile       string
+	)
+
+	cmd.StringVar(&host, "host", "127.0.0.1", "Адрес для прослушивания")
+	cmd.IntVar(&port, "port", 8081, "Порт")
+	cmd.StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к базе данных SQLite")
+	cmd.StringVar(&responderCert, "responder-cert", "", "Путь к сертификату OCSP-ответчика (PEM)")
+	cmd.StringVar(&responderKey, "responder-key", "", "Путь к ключу OCSP-ответчика (PEM, незашифрованный)")
+	cmd.StringVar(&caCert, "ca-cert", "", "Путь к сертификату издателя (PEM)")
+	cmd.IntVar(&cacheTTL, "cache-ttl", 60, "Время жизни кэша в секундах")
+	cmd.StringVar(&logFile, "log-file", "", "Файл для логов OCSP сервера")
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	if responderCert == "" {
+		return fmt.Errorf("--responder-cert обязателен")
+	}
+	if responderKey == "" {
+		return fmt.Errorf("--responder-key обязателен")
+	}
+	if caCert == "" {
+		return fmt.Errorf("--ca-cert обязателен")
+	}
+
+	var ocspLogger *log.Logger
+	if logFile != "" {
+		logDir := filepath.Dir(logFile)
+		if logDir != "." && logDir != "" {
+			if err := os.MkdirAll(logDir, 0755); err != nil {
+				return fmt.Errorf("не удалось создать директорию для логов: %w", err)
+			}
+		}
+		file, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("не удалось открыть файл логов: %w", err)
+		}
+		ocspLogger = log.New(io.MultiWriter(file, os.Stdout), "[OCSP] ", log.LstdFlags)
+	} else {
+		ocspLogger = log.New(os.Stdout, "[OCSP] ", log.LstdFlags)
+	}
+
+	responderCertObj, err := certs.LoadCertificate(responderCert)
+	if err != nil {
+		return fmt.Errorf("не удалось загрузить сертификат ответчика: %w", err)
+	}
+
+	keyPEM, err := os.ReadFile(responderKey)
+	if err != nil {
+		return fmt.Errorf("не удалось прочитать ключ: %w", err)
+	}
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		return fmt.Errorf("не удалось декодировать PEM ключа")
+	}
+	responderKeyObj, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		responderKeyObj, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			return fmt.Errorf("не удалось разобрать ключ: %w", err)
+		}
+	}
+
+	caCertObj, err := certs.LoadCertificate(caCert)
+	if err != nil {
+		return fmt.Errorf("не удалось загрузить сертификат CA: %w", err)
+	}
+
+	db, err := database.New(dbPath)
+	if err != nil {
+		return fmt.Errorf("не удалось подключиться к БД: %w", err)
+	}
+	defer db.Close()
+
+	checker := db.NewDatabaseStatusChecker()
+	responder := ocsp.NewResponder(&ocsp.ResponderConfig{
+		DB:            checker,
+		ResponderCert: responderCertObj,
+		ResponderKey:  responderKeyObj.(stdcrypto.PrivateKey),
+		IssuerCert:    caCertObj,
+		CacheTTL:      cacheTTL,
+		Logger:        ocspLogger,
+		EnableCache:   true,
+	})
+
+	addr := fmt.Sprintf("%s:%d", host, port)
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      responder,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
+	}
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		ocspLogger.Println("Получен сигнал завершения, останавливаем OCSP-ответчик...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			ocspLogger.Printf("Ошибка при остановке сервера: %v", err)
+		}
+	}()
+
+	ocspLogger.Printf("Запуск OCSP-ответчика на %s", addr)
+	ocspLogger.Printf("База данных: %s", dbPath)
+	ocspLogger.Printf("Сертификат ответчика: %s", responderCert)
+	ocspLogger.Printf("Сертификат издателя: %s", caCert)
+	ocspLogger.Printf("Кэш TTL: %d секунд", cacheTTL)
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("ошибка сервера: %w", err)
+	}
+
+	return nil
+}
+
+// runCAIssueOCSPCert обрабатывает подкоманду 'ca issue-ocsp-cert'
+func runCAIssueOCSPCert(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("issue-ocsp-cert", flag.ContinueOnError)
+
+	var (
+		caCertPath   string
+		caKeyPath    string
+		caPassFile   string
+		subject      string
+		sans         arrayFlags
+		keyType      string
+		keySize      int
+		outDir       string
+		validityDays int
+	)
+
+	cmd.StringVar(&caCertPath, "ca-cert", "", "Сертификат промежуточного CA (PEM)")
+	cmd.StringVar(&caKeyPath, "ca-key", "", "Зашифрованный закрытый ключ CA (PEM)")
+	cmd.StringVar(&caPassFile, "ca-pass-file", "", "Парольная фраза для ключа CA")
+	cmd.StringVar(&subject, "subject", "", "Различающееся имя для OCSP-сертификата")
+	cmd.Var(&sans, "san", "Альтернативные имена субъекта (dns:... или uri:...)")
+	cmd.StringVar(&keyType, "key-type", "rsa", "Тип ключа: rsa или ecc")
+	cmd.IntVar(&keySize, "key-size", 0, "Размер ключа (RSA: 2048/4096, ECC: 256/384)")
+	cmd.StringVar(&outDir, "out-dir", "./pki/certs", "Выходная директория")
+	cmd.IntVar(&validityDays, "validity-days", 365, "Срок действия в днях")
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	if caCertPath == "" {
+		return fmt.Errorf("--ca-cert обязателен")
+	}
+	if caKeyPath == "" {
+		return fmt.Errorf("--ca-key обязателен")
+	}
+	if caPassFile == "" {
+		return fmt.Errorf("--ca-pass-file обязателен")
+	}
+	if subject == "" {
+		return fmt.Errorf("--subject обязателен")
+	}
+	if keySize == 0 {
+		if strings.ToLower(keyType) == "rsa" {
+			keySize = 2048
+		} else {
+			keySize = 256
+		}
+	}
+
+	keyType = strings.ToLower(keyType)
+	if keyType != "rsa" && keyType != "ecc" {
+		return fmt.Errorf("--key-type должен быть 'rsa' или 'ecc'")
+	}
+	if keyType == "rsa" && (keySize != 2048 && keySize != 4096) {
+		return fmt.Errorf("размер RSA ключа должен быть 2048 или 4096")
+	}
+	if keyType == "ecc" && (keySize != 256 && keySize != 384) {
+		return fmt.Errorf("размер ECC ключа должен быть 256 или 384")
+	}
+
+	caPassphrase, err := readPassphraseFromFile(caPassFile)
+	if err != nil {
+		return fmt.Errorf("не удалось прочитать парольную фразу CA: %w", err)
+	}
+	defer crypto.SecureZero(caPassphrase)
+
+	parsedSubject, err := certs.ParseDN(subject)
+	if err != nil {
+		return fmt.Errorf("не удалось разобрать субъект: %w", err)
+	}
+
+	var parsedSANs []templates.SAN
+	for _, san := range sans {
+		parsed, err := templates.ParseSANString(san)
+		if err != nil {
+			return fmt.Errorf("неверный SAN '%s': %w", san, err)
+		}
+		if parsed.Type != "dns" && parsed.Type != "uri" {
+			return fmt.Errorf("OCSP сертификат может содержать только DNS или URI SAN")
+		}
+		parsedSANs = append(parsedSANs, parsed)
+	}
+
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return fmt.Errorf("не удалось создать выходную директорию: %w", err)
+	}
+
+	config := &ocsp.SignerConfig{
+		CACertPath:   caCertPath,
+		CAKeyPath:    caKeyPath,
+		CAPassphrase: caPassphrase,
+		Subject:      parsedSubject,
+		SANs:         parsedSANs,
+		KeyType:      keyType,
+		KeySize:      keySize,
+		ValidityDays: validityDays,
+		OutDir:       outDir,
+	}
+
+	if err := ocsp.IssueOCSPCertificate(config); err != nil {
+		return fmt.Errorf("не удалось выпустить OCSP-сертификат: %w", err)
+	}
+
+	return nil
 }
