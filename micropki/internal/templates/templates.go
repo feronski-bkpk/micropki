@@ -99,7 +99,6 @@ func NewServerTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		return nil, fmt.Errorf("серверный сертификат требует хотя бы один SAN (DNS или IP)")
 	}
 
-	// Проверка наличия хотя бы одного DNS или IP SAN
 	hasValidSAN := false
 	for _, san := range cfg.SANs {
 		if san.Type == "dns" || san.Type == "ip" {
@@ -111,7 +110,6 @@ func NewServerTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		return nil, fmt.Errorf("серверный сертификат должен иметь хотя бы одно DNS имя или IP адрес в SAN")
 	}
 
-	// Разделение SAN по типам
 	dnsNames, ipAddresses, emailAddresses, uris := splitSANs(cfg.SANs)
 
 	template := &x509.Certificate{
@@ -120,25 +118,21 @@ func NewServerTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		NotBefore:    cfg.NotBefore,
 		NotAfter:     cfg.NotAfter,
 
-		// Basic Constraints: CA=FALSE (критическое)
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 
-		// Key Usage: digitalSignature, keyEncipherment (PKI-8)
-		KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-
-		// Extended Key Usage: serverAuth
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 
-		// Subject Alternative Name
 		DNSNames:       dnsNames,
 		IPAddresses:    ipAddresses,
 		EmailAddresses: emailAddresses,
 		URIs:           uris,
-
-		// Subject Key Identifier будет сгенерирован автоматически
-		// Authority Key Identifier будет установлен издателем
 	}
+
+	AddOCSPAIA(template, GetDefaultOCSPURL())
+
+	AddCRLCDP(template, GetDefaultCRLURL("intermediate"))
 
 	return template, nil
 }
@@ -157,7 +151,6 @@ func NewServerTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 //   - *x509.Certificate: готовый шаблон сертификата
 //   - error: ошибку, если конфигурация невалидна
 func NewClientTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
-	// Разделение SAN по типам
 	dnsNames, ipAddresses, emailAddresses, uris := splitSANs(cfg.SANs)
 
 	template := &x509.Certificate{
@@ -166,17 +159,13 @@ func NewClientTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		NotBefore:    cfg.NotBefore,
 		NotAfter:     cfg.NotAfter,
 
-		// Basic Constraints: CA=FALSE (критическое)
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 
-		// Key Usage: digitalSignature (PKI-8)
 		KeyUsage: x509.KeyUsageDigitalSignature,
 
-		// Extended Key Usage: clientAuth
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 
-		// Subject Alternative Name
 		DNSNames:       dnsNames,
 		IPAddresses:    ipAddresses,
 		EmailAddresses: emailAddresses,
@@ -200,14 +189,12 @@ func NewClientTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 //   - *x509.Certificate: готовый шаблон сертификата
 //   - error: ошибку, если конфигурация невалидна
 func NewCodeSigningTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
-	// Для подписи кода проверяем, что нет IP или email SAN
 	for _, san := range cfg.SANs {
 		if san.Type == "ip" || san.Type == "email" {
 			return nil, fmt.Errorf("сертификат подписи кода не может содержать IP или email SAN")
 		}
 	}
 
-	// Разделение SAN по типам
 	dnsNames, ipAddresses, emailAddresses, uris := splitSANs(cfg.SANs)
 
 	template := &x509.Certificate{
@@ -216,20 +203,16 @@ func NewCodeSigningTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 		NotBefore:    cfg.NotBefore,
 		NotAfter:     cfg.NotAfter,
 
-		// Basic Constraints: CA=FALSE (критическое)
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 
-		// Key Usage: digitalSignature
 		KeyUsage: x509.KeyUsageDigitalSignature,
 
-		// Extended Key Usage: codeSigning
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning},
 
-		// Subject Alternative Name (ограничен DNS/URI)
 		DNSNames:       dnsNames,
-		IPAddresses:    ipAddresses,    // Должен быть пустым из-за проверки выше
-		EmailAddresses: emailAddresses, // Должен быть пустым из-за проверки выше
+		IPAddresses:    ipAddresses,
+		EmailAddresses: emailAddresses,
 		URIs:           uris,
 	}
 
@@ -253,17 +236,12 @@ func NewIntermediateCATemplate(cfg *TemplateConfig) *x509.Certificate {
 		NotBefore:    cfg.NotBefore,
 		NotAfter:     cfg.NotAfter,
 
-		// Basic Constraints: CA=TRUE, pathLenConstraint (критическое)
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		MaxPathLen:            cfg.MaxPathLen,
 		MaxPathLenZero:        cfg.MaxPathLen == 0,
 
-		// Key Usage: keyCertSign, cRLSign (критическое)
 		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-
-		// Subject Key Identifier будет сгенерирован автоматически
-		// Authority Key Identifier будет установлен издателем
 	}
 
 	return template
@@ -294,8 +272,6 @@ func ValidateTemplateCompatibility(tmplType TemplateType, sans []SAN) error {
 		}
 
 	case Client:
-		// Клиентский шаблон может содержать любые типы SAN
-		// Строгих требований нет
 
 	case CodeSigning:
 		for _, san := range sans {
@@ -330,10 +306,8 @@ func ParseSANString(san string) (SAN, error) {
 		return SAN{}, fmt.Errorf("пустое значение SAN для типа %s", sanType)
 	}
 
-	// Валидация в зависимости от типа
 	switch sanType {
 	case "dns", "email", "uri":
-		// Базовая валидация, фактический формат будет проверен при кодировании
 	case "ip":
 		if net.ParseIP(value) == nil {
 			return SAN{}, fmt.Errorf("неверный IP адрес: %s", value)
@@ -422,4 +396,39 @@ func NewOCSPResponderTemplate(cfg *TemplateConfig) (*x509.Certificate, error) {
 	}
 
 	return template, nil
+}
+
+// AddOCSPAIA добавляет расширение Authority Information Access с OCSP responder URL
+func AddOCSPAIA(template *x509.Certificate, ocspURL string) {
+	if ocspURL == "" {
+		return
+	}
+
+	template.OCSPServer = append(template.OCSPServer, ocspURL)
+}
+
+// AddCRLCDP добавляет расширение CRL Distribution Points
+func AddCRLCDP(template *x509.Certificate, crlURL string) {
+	if crlURL == "" {
+		return
+	}
+
+	template.CRLDistributionPoints = append(template.CRLDistributionPoints, crlURL)
+}
+
+// GetDefaultOCSPURL возвращает URL OCSP responder по умолчанию
+func GetDefaultOCSPURL() string {
+	return "http://localhost:8081"
+}
+
+// GetDefaultCRLURL возвращает URL CRL по умолчанию для указанного CA
+func GetDefaultCRLURL(caType string) string {
+	switch caType {
+	case "root":
+		return "http://localhost:8080/crl/root.crl"
+	case "intermediate":
+		return "http://localhost:8080/crl/intermediate.crl"
+	default:
+		return "http://localhost:8080/crl/intermediate.crl"
+	}
 }

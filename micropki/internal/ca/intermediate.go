@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"micropki/micropki/internal/certs"
-	cryptolib "micropki/micropki/internal/crypto" // алиас для избежания конфликта имён с стандартным crypto
+	cryptolib "micropki/micropki/internal/crypto"
 	"micropki/micropki/internal/csr"
 	"micropki/micropki/internal/templates"
 )
@@ -180,18 +180,6 @@ type IssueCertificateConfig struct {
 // Функция поддерживает два режима работы:
 //  1. Генерация новой ключевой пары и создание сертификата
 //  2. Подписание внешнего CSR (без генерации ключа)
-//
-// Функция выполняет следующие шаги:
-//  1. Загрузка сертификата и ключа промежуточного CA
-//  2. Проверка совместимости шаблона с SAN
-//  3. Обработка CSR или генерация новой ключевой пары
-//  4. Генерация серийного номера
-//  5. Создание шаблона сертификата согласно типу
-//  6. Подписание сертификата промежуточным CA
-//  7. Сохранение сертификата
-//  8. Сохранение закрытого ключа (если генерировался)
-//
-// Возвращает ошибку, если какой-либо из шагов завершился неудачей.
 func IssueCertificate(cfg *IssueCertificateConfig) error {
 	// 1. Загрузка сертификата и ключа CA
 	caCert, err := certs.LoadCertificate(cfg.CACertPath)
@@ -204,30 +192,18 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		return fmt.Errorf("не удалось загрузить закрытый ключ CA: %w", err)
 	}
 
-	// 2. Проверка CA
-	if caCert.IsCA && caCert.MaxPathLen == 0 {
-	}
-
-	// 3. Проверка совместимости шаблона с SAN
-	if err := templates.ValidateTemplateCompatibility(cfg.Template, cfg.SANs); err != nil {
-		return fmt.Errorf("проверка шаблона не пройдена: %w", err)
-	}
-
 	var publicKey crypto.PublicKey
 	var privateKey crypto.PrivateKey
 	var certSubject *pkix.Name
 	var certSANs []templates.SAN
 
-	// 4. Обработка CSR или генерация новой ключевой пары
+	// 2. Обработка CSR или генерация новой ключевой пары
 	if cfg.CSRPath != "" {
-		// Подписание внешнего CSR
 		certSubject, certSANs, publicKey, err = processExternalCSR(cfg)
 		if err != nil {
 			return fmt.Errorf("не удалось обработать внешний CSR: %w", err)
 		}
-		// Для внешнего CSR закрытый ключ не сохраняется
 	} else {
-		// Генерация новой ключевой пары
 		keyPair, err := cryptolib.GenerateKeyPair(cfg.KeyType, cfg.KeySize)
 		if err != nil {
 			return fmt.Errorf("не удалось сгенерировать ключевую пару: %w", err)
@@ -236,19 +212,23 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		privateKey = keyPair.PrivateKey
 		certSubject = cfg.Subject
 		certSANs = cfg.SANs
+
+		if err := templates.ValidateTemplateCompatibility(cfg.Template, certSANs); err != nil {
+			return fmt.Errorf("проверка шаблона не пройдена: %w", err)
+		}
 	}
 
-	// 5. Генерация серийного номера
+	// 3. Генерация серийного номера
 	serialNumber, err := templates.NewSerialNumber()
 	if err != nil {
 		return fmt.Errorf("не удалось сгенерировать серийный номер: %w", err)
 	}
 
-	// 6. Установка периода действия
+	// 4. Установка периода действия
 	notBefore := time.Now().UTC()
 	notAfter := notBefore.AddDate(0, 0, cfg.ValidityDays)
 
-	// 7. Создание шаблона согласно типу
+	// 5. Создание шаблона согласно типу
 	tmplCfg := &templates.TemplateConfig{
 		Subject:      certSubject,
 		SANs:         certSANs,
@@ -273,34 +253,34 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		return fmt.Errorf("не удалось создать шаблон: %w", err)
 	}
 
-	// 8. Создание сертификата
+	// 6. Создание сертификата
 	certDER, err := x509.CreateCertificate(
 		rand.Reader,
-		template,  // шаблон нового сертификата
-		caCert,    // сертификат издателя (промежуточный CA)
-		publicKey, // открытый ключ нового сертификата
-		caKey,     // закрытый ключ издателя
+		template,
+		caCert,
+		publicKey,
+		caKey,
 	)
 	if err != nil {
 		return fmt.Errorf("не удалось создать сертификат: %w", err)
 	}
 
-	// 9. Парсинг созданного сертификата для получения информации для имени файла
+	// 7. Парсинг созданного сертификата для получения информации для имени файла
 	newCert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return fmt.Errorf("не удалось разобрать созданный сертификат: %w", err)
 	}
 
-	// 10. Определение имени файла на основе CN или первого DNS имени
+	// 8. Определение имени файла на основе CN или первого DNS имени
 	filename := generateCertFilename(newCert, cfg.Template)
 
-	// 11. Сохранение сертификата
+	// 9. Сохранение сертификата
 	certPath := filepath.Join(cfg.OutDir, filename+".cert.pem")
 	if err := certs.SaveCertificate(certDER, certPath); err != nil {
 		return fmt.Errorf("не удалось сохранить сертификат: %w", err)
 	}
 
-	// 12. Сохранение закрытого ключа, если он был сгенерирован
+	// 10. Сохранение закрытого ключа, если он был сгенерирован
 	var keyPath string
 	if privateKey != nil {
 		keyPath = filepath.Join(cfg.OutDir, filename+".key.pem")
@@ -313,7 +293,7 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		fmt.Printf("ПРЕДУПРЕЖДЕНИЕ: Закрытый ключ сохранён без шифрования в %s\n", keyPath)
 	}
 
-	// 13. Логирование выпуска
+	// 11. Логирование выпуска
 	fmt.Printf("\nСертификат успешно выпущен!\n")
 	fmt.Printf("Тип: %s\n", cfg.Template)
 	fmt.Printf("Сертификат: %s\n", certPath)
@@ -321,9 +301,9 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		fmt.Printf("Закрытый ключ: %s (НЕЗАШИФРОВАН)\n", keyPath)
 	}
 	fmt.Printf("Серийный номер: %X\n", newCert.SerialNumber)
-	if len(cfg.SANs) > 0 {
+	if len(certSANs) > 0 {
 		fmt.Printf("Альтернативные имена субъекта:\n")
-		for _, san := range cfg.SANs {
+		for _, san := range certSANs {
 			fmt.Printf("  %s: %s\n", san.Type, san.Value)
 		}
 	}
@@ -332,46 +312,31 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 }
 
 // processExternalCSR обрабатывает внешний CSR для подписания.
-// Функция выполняет:
-//  1. Чтение и парсинг CSR
-//  2. Проверку подписи CSR
-//  3. Извлечение субъекта, SAN и открытого ключа
-//  4. Проверку совместимости с шаблоном
-//
-// Возвращает субъект, SAN, открытый ключ или ошибку.
 func processExternalCSR(cfg *IssueCertificateConfig) (*pkix.Name, []templates.SAN, crypto.PublicKey, error) {
-	// Чтение файла CSR
 	csrPEM, err := os.ReadFile(cfg.CSRPath)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("не удалось прочитать файл CSR: %w", err)
 	}
-
-	// Парсинг и проверка CSR
 	parsedCSR, err := csr.ParseAndVerifyCSR(csrPEM)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("не удалось разобрать CSR: %w", err)
+		return nil, nil, nil, fmt.Errorf("недействительный CSR: %w", err)
 	}
 
-	// Проверка, не запрашивает ли CSR права CA
 	if csr.IsCARequest(parsedCSR) {
 		return nil, nil, nil, fmt.Errorf("CSR запрашивает CA=true - не разрешено для конечных сертификатов")
 	}
 
-	// Извлечение субъекта из CSR
 	subject := csr.GetSubjectFromCSR(parsedCSR)
 
-	// Извлечение SAN из CSR
 	sans, err := csr.GetSANsFromCSR(parsedCSR)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("не удалось извлечь SAN из CSR: %w", err)
 	}
 
-	// Проверка совместимости CSR с шаблоном
 	if err := csr.ValidateCSRForTemplate(parsedCSR, cfg.Template); err != nil {
 		return nil, nil, nil, fmt.Errorf("CSR несовместим с шаблоном: %w", err)
 	}
 
-	// Извлечение открытого ключа
 	publicKey, err := csr.ExtractPublicKey(parsedCSR)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("не удалось извлечь открытый ключ: %w", err)
@@ -389,19 +354,15 @@ func processExternalCSR(cfg *IssueCertificateConfig) (*pkix.Name, []templates.SA
 //
 // Возвращает безопасное для файловой системы имя.
 func generateCertFilename(cert *x509.Certificate, tmplType templates.TemplateType) string {
-	// Попытка использовать первое DNS имя для серверных сертификатов
 	if tmplType == templates.Server && len(cert.DNSNames) > 0 {
 		return sanitizeFilename(cert.DNSNames[0])
 	}
-	// Попытка использовать email для клиентских сертификатов
 	if tmplType == templates.Client && len(cert.EmailAddresses) > 0 {
 		return sanitizeFilename(cert.EmailAddresses[0])
 	}
-	// Использование Common Name
 	if cert.Subject.CommonName != "" {
 		return sanitizeFilename(cert.Subject.CommonName)
 	}
-	// В крайнем случае - серийный номер
 	return fmt.Sprintf("cert-%X", cert.SerialNumber)
 }
 
@@ -409,7 +370,6 @@ func generateCertFilename(cert *x509.Certificate, tmplType templates.TemplateTyp
 // Заменяет проблемные символы на подчёркивание.
 // Разрешённые символы: a-z, A-Z, 0-9, '-', '.'
 func sanitizeFilename(name string) string {
-	// Замена проблемных символов на подчёркивание
 	result := make([]byte, 0, len(name))
 	for _, c := range []byte(name) {
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' {
@@ -429,7 +389,6 @@ func sanitizeFilename(name string) string {
 func updatePolicyWithIntermediate(outDir string, cert *x509.Certificate, cfg *CAConfig) error {
 	policyPath := filepath.Join(outDir, "policy.txt")
 
-	// Чтение существующей политики или создание новой
 	var content []byte
 	if _, err := os.Stat(policyPath); err == nil {
 		content, err = os.ReadFile(policyPath)
@@ -438,7 +397,6 @@ func updatePolicyWithIntermediate(outDir string, cert *x509.Certificate, cfg *CA
 		}
 	}
 
-	// Добавление секции промежуточного CA
 	policy := string(content)
 	policy += "\n\n"
 	policy += "ПРОМЕЖУТОЧНЫЙ CA\n"
@@ -451,7 +409,6 @@ func updatePolicyWithIntermediate(outDir string, cert *x509.Certificate, cfg *CA
 	policy += fmt.Sprintf("  Начало: %s\n", cert.NotBefore.Format(time.RFC3339))
 	policy += fmt.Sprintf("  Окончание: %s\n", cert.NotAfter.Format(time.RFC3339))
 
-	// Получение информации об алгоритме ключа
 	algo, size, _ := certs.GetKeyAlgorithm(cert.PublicKey)
 	policy += fmt.Sprintf("Алгоритм ключа: %s-%d\n", algo, size)
 

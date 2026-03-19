@@ -30,7 +30,7 @@ type Responder struct {
 type ResponderConfig struct {
 	DB            StatusChecker
 	ResponderCert *x509.Certificate
-	ResponderKey  crypto.PrivateKey
+	ResponderKey  crypto.Signer
 	IssuerCert    *x509.Certificate
 	CacheTTL      int
 	Logger        *log.Logger
@@ -105,12 +105,6 @@ func (r *Responder) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 // handleRequest обрабатывает OCSP-запрос
 func (r *Responder) handleRequest(requestDER []byte, clientIP string) ([]byte, error) {
-	if r.cache != nil {
-		if cached := r.cache.Get(requestDER); cached != nil {
-			return cached, nil
-		}
-	}
-
 	req, err := ParseRequest(requestDER)
 	if err != nil {
 		return nil, err
@@ -120,12 +114,18 @@ func (r *Responder) handleRequest(requestDER []byte, clientIP string) ([]byte, e
 		return nil, err
 	}
 
-	nonce, _ := req.GetNonce()
-	nonceStr := ""
-	if nonce != nil {
-		nonceStr = hex.EncodeToString(nonce)
-		if len(nonceStr) > 8 {
-			nonceStr = nonceStr[:8] + "..."
+	var serialHex string
+	var statusResult *StatusResult
+
+	if len(req.RequestList) > 0 {
+		serial := req.RequestList[0].CertID.SerialNumber
+		serialHex = hex.EncodeToString(serial.Bytes())
+
+		statusResult, err = r.db.GetCertificateStatus(serialHex)
+		if err != nil {
+			r.logger.Printf("ERROR: Failed to get status from DB for %s: %v", serialHex, err)
+		} else {
+			r.logger.Printf("Certificate %s status from DB: %s", serialHex, statusResult.Status.String())
 		}
 	}
 
@@ -146,14 +146,15 @@ func (r *Responder) handleRequest(requestDER []byte, clientIP string) ([]byte, e
 		return nil, err
 	}
 
-	if r.cache != nil {
-		r.cache.Set(requestDER, responseDER)
+	if r.cache != nil && statusResult != nil && statusResult.Status == StatusRevoked {
+		r.cache.InvalidateBySerial(serialHex)
+		r.logger.Printf("Cache invalidated for revoked certificate %s", serialHex)
 	}
 
 	return responseDER, nil
 }
 
-// buildErrorResponse строит ответ с ошибкой (использует asn1Response из response.go)
+// buildErrorResponse строит ответ с ошибкой
 func (r *Responder) buildErrorResponse(status OCSPResponseStatus) ([]byte, error) {
 	type errorResponse struct {
 		Status int
@@ -215,17 +216,4 @@ func (r *Responder) logRequest(clientIP string, requestDER []byte, responseDER [
 
 	r.logger.Printf("INFO: client=%s method=OCSP status=%s serials=%v nonce=%s duration=%v",
 		clientIP, status, serials, nonceStr, duration)
-}
-
-// ParseResponse разбирает OCSP-ответ (упрощённо)
-func ParseResponse(der []byte) (*respResponse, error) {
-	var resp respResponse
-	rest, err := asn1.Unmarshal(der, &resp)
-	if err != nil {
-		return nil, err
-	}
-	if len(rest) > 0 {
-		return nil, fmt.Errorf("лишние данные после ответа")
-	}
-	return &resp, nil
 }

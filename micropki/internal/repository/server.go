@@ -3,6 +3,7 @@
 package repository
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
@@ -14,7 +15,9 @@ import (
 	"strings"
 	"time"
 
+	"micropki/micropki/internal/ca"
 	"micropki/micropki/internal/database"
+	"micropki/micropki/internal/templates"
 )
 
 // Server представляет HTTP сервер репозитория сертификатов.
@@ -89,6 +92,7 @@ func (s *Server) Start(host string, port int) error {
 	mux.HandleFunc("/ca/", s.handleCA)
 	mux.HandleFunc("/crl", s.handleCRL)
 	mux.HandleFunc("/crl/", s.handleCRL)
+	mux.HandleFunc("/request-cert", s.handleRequestCert)
 
 	handler := s.loggingMiddleware(mux)
 
@@ -143,6 +147,133 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 			duration,
 		)
 	})
+}
+
+// handleRequestCert обрабатывает POST /request-cert
+func (s *Server) handleRequestCert(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	clientIP := r.RemoteAddr
+
+	s.logger.Printf("API REQUEST: POST /request-cert from %s, template=%s",
+		clientIP, r.URL.Query().Get("template"))
+
+	if r.Method != http.MethodPost {
+		s.logger.Printf("API ERROR: Method not allowed from %s: %s", clientIP, r.Method)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	apiKey := r.Header.Get("X-API-Key")
+	if apiKey == "" {
+		s.logger.Printf("API WARN: Request without API key from %s", clientIP)
+	} else {
+		s.logger.Printf("API INFO: Request with API key from %s", clientIP)
+	}
+
+	csrPEM, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.logger.Printf("API ERROR: Failed to read request body from %s: %v", clientIP, err)
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	if len(csrPEM) == 0 {
+		s.logger.Printf("API ERROR: Empty request body from %s", clientIP)
+		http.Error(w, "Empty request body", http.StatusBadRequest)
+		return
+	}
+
+	block, _ := pem.Decode(csrPEM)
+	if block == nil || (block.Type != "CERTIFICATE REQUEST" && block.Type != "NEW CERTIFICATE REQUEST") {
+		s.logger.Printf("API ERROR: Invalid CSR format from %s", clientIP)
+		http.Error(w, "Invalid CSR format", http.StatusBadRequest)
+		return
+	}
+
+	template := r.URL.Query().Get("template")
+	if template == "" {
+		s.logger.Printf("API ERROR: Missing template parameter from %s", clientIP)
+		http.Error(w, "Missing template parameter", http.StatusBadRequest)
+		return
+	}
+
+	var tmplType templates.TemplateType
+	switch template {
+	case "server":
+		tmplType = templates.Server
+	case "client":
+		tmplType = templates.Client
+	case "code_signing":
+		tmplType = templates.CodeSigning
+	default:
+		s.logger.Printf("API ERROR: Invalid template '%s' from %s", template, clientIP)
+		http.Error(w, "Invalid template. Must be server, client, or code_signing", http.StatusBadRequest)
+		return
+	}
+
+	s.logger.Printf("API INFO: Processing CSR request for template: %s from %s", template, clientIP)
+
+	caCertPath := filepath.Join(s.pkiDir, "intermediate", "certs", "intermediate.cert.pem")
+	caKeyPath := filepath.Join(s.pkiDir, "intermediate", "private", "intermediate.key.pem")
+	passFile := filepath.Join(s.pkiDir, "int-pass.txt")
+
+	if _, err := os.Stat(caCertPath); err != nil {
+		s.logger.Printf("API ERROR: CA certificate not found: %v", err)
+		http.Error(w, "CA certificate not found", http.StatusInternalServerError)
+		return
+	}
+	if _, err := os.Stat(caKeyPath); err != nil {
+		s.logger.Printf("API ERROR: CA key not found: %v", err)
+		http.Error(w, "CA key not found", http.StatusInternalServerError)
+		return
+	}
+
+	passphrase, err := os.ReadFile(passFile)
+	if err != nil {
+		s.logger.Printf("API ERROR: Failed to read passphrase file: %v", err)
+		http.Error(w, "Failed to read CA passphrase", http.StatusInternalServerError)
+		return
+	}
+	passphrase = bytes.TrimRight(passphrase, "\r\n")
+
+	tempDir := filepath.Join(s.pkiDir, "temp")
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		s.logger.Printf("API ERROR: Failed to create temp dir: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	cert, err := ca.IssueCertificateFromCSR(
+		caCertPath,
+		caKeyPath,
+		passphrase,
+		csrPEM,
+		tmplType,
+		365,
+		tempDir,
+		s.db.Path(),
+		s.logger,
+	)
+
+	if err != nil {
+		s.logger.Printf("API ERROR: Failed to issue certificate: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to issue certificate: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: cert.Raw,
+	})
+
+	duration := time.Since(startTime)
+	s.logger.Printf("API SUCCESS: Certificate issued successfully for serial: %X from %s, duration: %v",
+		cert.SerialNumber, clientIP, duration)
+
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.Header().Set("X-Serial-Number", hex.EncodeToString(cert.SerialNumber.Bytes()))
+	w.WriteHeader(http.StatusCreated)
+	w.Write(certPEM)
 }
 
 // handleCertificate обрабатывает GET /certificate/<serial>
@@ -230,53 +361,31 @@ func (s *Server) handleCA(w http.ResponseWriter, r *http.Request) {
 
 // handleCRL обрабатывает все GET запросы к CRL эндпоинтам
 func (s *Server) handleCRL(w http.ResponseWriter, r *http.Request) {
-	s.logger.Printf("=== CRL HANDLER CALLED ===")
-	s.logger.Printf("Method: %s", r.Method)
-	s.logger.Printf("URL Path: %s", r.URL.Path)
-	s.logger.Printf("URL RawQuery: %s", r.URL.RawQuery)
-	s.logger.Printf("User-Agent: %s", r.UserAgent())
-	s.logger.Printf("RemoteAddr: %s", r.RemoteAddr)
-
 	if r.Method != http.MethodGet {
 		s.logger.Printf("ERROR: Method not allowed: %s", r.Method)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	s.logger.Printf("GET request accepted")
-
 	if r.URL.Path == "/crl" {
-		s.logger.Printf("Handling /crl endpoint")
-
 		caName := r.URL.Query().Get("ca")
-		s.logger.Printf("ca parameter: '%s'", caName)
-
 		if caName == "" {
 			caName = "intermediate"
-			s.logger.Printf("Using default ca: intermediate")
 		}
 
 		if caName != "root" && caName != "intermediate" {
-			s.logger.Printf("Invalid ca value: %s", caName)
 			http.Error(w, "CA must be 'root' or 'intermediate'", http.StatusBadRequest)
 			return
 		}
 
 		crlPath := filepath.Join(s.pkiDir, "crl", caName+".crl.pem")
-		s.logger.Printf("Looking for CRL at: %s", crlPath)
-
 		s.serveCRLFile(w, crlPath, caName)
 		return
 	}
 
 	if strings.HasPrefix(r.URL.Path, "/crl/") {
-		s.logger.Printf("Handling /crl/ endpoint")
-
 		filename := strings.TrimPrefix(r.URL.Path, "/crl/")
-		s.logger.Printf("Filename: %s", filename)
-
 		filename = filepath.Base(filename)
-		s.logger.Printf("Base filename: %s", filename)
 
 		var caName string
 		if filename == "root.crl" || filename == "root.crl.pem" {
@@ -284,21 +393,15 @@ func (s *Server) handleCRL(w http.ResponseWriter, r *http.Request) {
 		} else if filename == "intermediate.crl" || filename == "intermediate.crl.pem" {
 			caName = "intermediate"
 		} else {
-			s.logger.Printf("Invalid filename: %s", filename)
 			http.Error(w, "Invalid CRL filename", http.StatusBadRequest)
 			return
 		}
 
-		s.logger.Printf("CA name: %s", caName)
-
 		crlPath := filepath.Join(s.pkiDir, "crl", caName+".crl.pem")
-		s.logger.Printf("Looking for CRL at: %s", crlPath)
-
 		s.serveCRLFile(w, crlPath, caName)
 		return
 	}
 
-	s.logger.Printf("Unknown path: %s", r.URL.Path)
 	http.Error(w, "Not found", http.StatusNotFound)
 }
 
@@ -311,8 +414,6 @@ func (s *Server) serveCRLFile(w http.ResponseWriter, crlPath string, caName stri
 		return
 	}
 
-	s.logger.Printf("CRL file found, size: %d bytes", fileInfo.Size())
-
 	crlPEM, err := os.ReadFile(crlPath)
 	if err != nil {
 		s.logger.Printf("Error reading CRL file: %v", err)
@@ -320,73 +421,17 @@ func (s *Server) serveCRLFile(w http.ResponseWriter, crlPath string, caName stri
 		return
 	}
 
-	s.logger.Printf("Successfully read CRL file, size: %d bytes", len(crlPEM))
+	etag := fmt.Sprintf("\"%d-%d\"", fileInfo.Size(), fileInfo.ModTime().Unix())
 
 	w.Header().Set("Content-Type", "application/pkix-crl")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.crl.pem\"", caName))
 	w.Header().Set("Last-Modified", fileInfo.ModTime().UTC().Format(http.TimeFormat))
-	w.Header().Set("ETag", fmt.Sprintf("\"%d-%d\"", fileInfo.Size(), fileInfo.ModTime().Unix()))
+	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "public, max-age=3600, must-revalidate")
 
 	w.WriteHeader(http.StatusOK)
 	w.Write(crlPEM)
-	s.logger.Printf("Successfully served CRL for %s", caName)
-}
-
-// handleCRLFile обрабатывает GET /crl/<filename>.crl для статических файлов
-func (s *Server) handleCRLFile(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		s.logger.Printf("Method not allowed: %s", r.Method)
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	filename := strings.TrimPrefix(r.URL.Path, "/crl/")
-	if filename == "" {
-		http.Error(w, "Имя файла CRL не указано", http.StatusBadRequest)
-		return
-	}
-
-	s.logger.Printf("Handling CRL file request: %s", filename)
-
-	if !strings.HasSuffix(filename, ".crl") && !strings.HasSuffix(filename, ".crl.pem") {
-		s.logger.Printf("Invalid file extension: %s", filename)
-		http.Error(w, "Неверный формат файла CRL", http.StatusBadRequest)
-		return
-	}
-
-	filename = filepath.Base(filename)
-
-	crlPath := filepath.Join(s.pkiDir, "crl", filename)
-	s.logger.Printf("Looking for CRL file at: %s", crlPath)
-
-	if _, err := os.Stat(crlPath); err != nil {
-		s.logger.Printf("CRL file not found: %v", err)
-		http.Error(w, "CRL файл не найден", http.StatusNotFound)
-		return
-	}
-
-	crlPEM, err := os.ReadFile(crlPath)
-	if err != nil {
-		s.logger.Printf("Error reading CRL file: %v", err)
-		http.Error(w, "Ошибка чтения CRL файла", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/pkix-crl")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
-
-	fileInfo, err := os.Stat(crlPath)
-	if err == nil {
-		w.Header().Set("Last-Modified", fileInfo.ModTime().UTC().Format(http.TimeFormat))
-		etag := fmt.Sprintf("\"%d-%d\"", fileInfo.Size(), fileInfo.ModTime().Unix())
-		w.Header().Set("ETag", etag)
-		w.Header().Set("Cache-Control", "public, max-age=3600, must-revalidate")
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write(crlPEM)
-	s.logger.Printf("Successfully served CRL file %s, size: %d bytes", filename, len(crlPEM))
+	s.logger.Printf("Successfully served CRL for %s, ETag: %s", caName, etag)
 }
 
 // handleHealth обрабатывает GET /health для проверки работоспособности
@@ -401,18 +446,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	crlDir := filepath.Join(s.pkiDir, "crl")
-	if _, err := os.Stat(crlDir); err != nil {
-		s.logger.Printf("ПРЕДУПРЕЖДЕНИЕ: Директория CRL не доступна: %v", err)
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"ok","database":"connected"}`))
 }
 
 // tryServeFromFileSystem пытается найти сертификат в файловой системе
-// для обратной совместимости.
 func (s *Server) tryServeFromFileSystem(w http.ResponseWriter, serialHex string) bool {
 	possiblePaths := []string{
 		filepath.Join(s.certDir, serialHex+".pem"),

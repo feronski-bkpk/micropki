@@ -5,9 +5,8 @@ package database
 import (
 	"crypto/x509"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
-	"math/big"
+	"log"
 	"micropki/micropki/internal/certs"
 	"micropki/micropki/internal/ocsp"
 	"os"
@@ -50,11 +49,11 @@ type CRLMetadata struct {
 // DB представляет подключение к базе данных SQLite.
 type DB struct {
 	*sql.DB
-	path string
+	path   string
+	logger *log.Logger
 }
 
 // New создает новое подключение к базе данных SQLite.
-// Если база данных не существует, она будет создана при вызове InitSchema.
 func New(dbPath string) (*DB, error) {
 	dbDir := filepath.Dir(dbPath)
 	if dbDir != "." && dbDir != "" {
@@ -72,7 +71,9 @@ func New(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("не удалось подключиться к БД: %w", err)
 	}
 
-	return &DB{DB: db, path: dbPath}, nil
+	logger := log.New(os.Stdout, "[DB] ", log.LstdFlags)
+
+	return &DB{DB: db, path: dbPath, logger: logger}, nil
 }
 
 // InitSchema создает схему базы данных, если она еще не существует.
@@ -147,7 +148,6 @@ func (db *DB) InitSchemaWithCRL() error {
 }
 
 // InsertCertificate вставляет новую запись сертификата в базу данных.
-// Возвращает ошибку, если сертификат с таким серийным номером уже существует.
 func (db *DB) InsertCertificate(record *CertificateRecord) error {
 	notBefore := record.NotBefore.UTC().Format(time.RFC3339)
 	notAfter := record.NotAfter.UTC().Format(time.RFC3339)
@@ -217,28 +217,15 @@ func (db *DB) GetCertificateBySerial(serialHex string) (*CertificateRecord, erro
 		return nil, fmt.Errorf("ошибка при получении сертификата: %w", err)
 	}
 
-	record.NotBefore, err = time.Parse(time.RFC3339, notBeforeStr)
-	if err != nil {
-		return nil, fmt.Errorf("не удалось распарсить not_before: %w", err)
-	}
-	record.NotAfter, err = time.Parse(time.RFC3339, notAfterStr)
-	if err != nil {
-		return nil, fmt.Errorf("не удалось распарсить not_after: %w", err)
-	}
-	record.CreatedAt, err = time.Parse(time.RFC3339, createdAtStr)
-	if err != nil {
-		return nil, fmt.Errorf("не удалось распарсить created_at: %w", err)
-	}
+	record.NotBefore, _ = time.Parse(time.RFC3339, notBeforeStr)
+	record.NotAfter, _ = time.Parse(time.RFC3339, notAfterStr)
+	record.CreatedAt, _ = time.Parse(time.RFC3339, createdAtStr)
 
 	if revocationReason.Valid {
 		record.RevocationReason = revocationReason
 	}
 	if revocationDate.Valid {
-		var revDate time.Time
-		revDate, err = time.Parse(time.RFC3339, revocationDate.String)
-		if err != nil {
-			return nil, fmt.Errorf("не удалось распарсить revocation_date: %w", err)
-		}
+		revDate, _ := time.Parse(time.RFC3339, revocationDate.String)
 		record.RevocationDate = sql.NullTime{Time: revDate, Valid: true}
 	}
 
@@ -302,7 +289,6 @@ func (db *DB) ListCertificates(status string, issuer string) ([]*CertificateReco
 }
 
 // UpdateCertificateStatus обновляет статус сертификата.
-// Для отзыва также устанавливает причину и дату отзыва.
 func (db *DB) UpdateCertificateStatus(serialHex string, status string, reason string) error {
 	var err error
 
@@ -330,7 +316,7 @@ func (db *DB) UpdateCertificateStatus(serialHex string, status string, reason st
 	return nil
 }
 
-// GetRevokedCertificates возвращает все отозванные сертификаты (для CRL).
+// GetRevokedCertificates возвращает все отозванные сертификаты.
 func (db *DB) GetRevokedCertificates() ([]*CertificateRecord, error) {
 	querySQL := `
 	SELECT serial_hex, revocation_reason, revocation_date
@@ -368,7 +354,7 @@ func (db *DB) GetRevokedCertificates() ([]*CertificateRecord, error) {
 	return records, nil
 }
 
-// GetRevokedCertificatesForIssuer возвращает все отозванные сертификаты для указанного издателя.
+// GetRevokedCertificatesForIssuer возвращает отозванные сертификаты для указанного издателя.
 func (db *DB) GetRevokedCertificatesForIssuer(issuer string) ([]*CertificateRecord, error) {
 	querySQL := `
     SELECT serial_hex, revocation_reason, revocation_date
@@ -400,12 +386,8 @@ func (db *DB) GetRevokedCertificatesForIssuer(issuer string) ([]*CertificateReco
 		record.SerialHex = strings.ToUpper(record.SerialHex)
 
 		if revocationDateStr != "" {
-			revDate, err := time.Parse(time.RFC3339, revocationDateStr)
-			if err != nil {
-				record.RevocationDate = sql.NullTime{Time: time.Now().UTC(), Valid: true}
-			} else {
-				record.RevocationDate = sql.NullTime{Time: revDate, Valid: true}
-			}
+			revDate, _ := time.Parse(time.RFC3339, revocationDateStr)
+			record.RevocationDate = sql.NullTime{Time: revDate, Valid: true}
 		} else {
 			record.RevocationDate = sql.NullTime{Time: time.Now().UTC(), Valid: true}
 		}
@@ -413,14 +395,10 @@ func (db *DB) GetRevokedCertificatesForIssuer(issuer string) ([]*CertificateReco
 		records = append(records, record)
 	}
 
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("ошибка при итерации по строкам: %w", err)
-	}
-
 	return records, nil
 }
 
-// UpdateCRLMetadata обновляет метаданные CRL для указанного CA.
+// UpdateCRLMetadata обновляет метаданные CRL.
 func (db *DB) UpdateCRLMetadata(metadata *CRLMetadata) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 
@@ -474,7 +452,7 @@ func (db *DB) UpdateCRLMetadata(metadata *CRLMetadata) error {
 	return nil
 }
 
-// GetCRLMetadata возвращает метаданные CRL для указанного CA.
+// GetCRLMetadata возвращает метаданные CRL.
 func (db *DB) GetCRLMetadata(caSubject string) (*CRLMetadata, error) {
 	var (
 		lastGeneratedStr, thisUpdateStr, nextUpdateStr, createdAtStr, updatedAtStr string
@@ -525,21 +503,19 @@ func (db *DB) Path() string {
 	return db.path
 }
 
-// GetCertificateStatusForOCSP возвращает статус сертификата для OCSP
-func (db *DB) GetCertificateStatusForOCSP(issuerNameHash, issuerKeyHash []byte, serial *big.Int) (*ocsp.StatusResult, error) {
-	serialHex := hex.EncodeToString(serial.Bytes())
+// GetCertificateStatus возвращает статус сертификата по серийному номеру
+func (db *DB) GetCertificateStatus(serialHex string) (*ocsp.StatusResult, error) {
 
 	var status string
 	var revocationReason sql.NullString
 	var revocationDate sql.NullString
-	var issuer string
 
 	err := db.QueryRow(
-		`SELECT status, revocation_reason, revocation_date, issuer 
-		 FROM certificates 
-		 WHERE serial_hex = ?`,
+		`SELECT status, revocation_reason, revocation_date 
+         FROM certificates 
+         WHERE serial_hex = ?`,
 		serialHex,
-	).Scan(&status, &revocationReason, &revocationDate, &issuer)
+	).Scan(&status, &revocationReason, &revocationDate)
 
 	if err == sql.ErrNoRows {
 		return &ocsp.StatusResult{
@@ -551,60 +527,47 @@ func (db *DB) GetCertificateStatusForOCSP(issuerNameHash, issuerKeyHash []byte, 
 		return nil, fmt.Errorf("ошибка при запросе статуса: %w", err)
 	}
 
+	result := &ocsp.StatusResult{
+		ThisUpdate: time.Now().UTC(),
+	}
+
 	switch status {
 	case "valid":
-		return &ocsp.StatusResult{
-			Status:     ocsp.StatusGood,
-			ThisUpdate: time.Now().UTC(),
-		}, nil
+		result.Status = ocsp.StatusGood
 
 	case "revoked":
-		var revTime time.Time
+		result.Status = ocsp.StatusRevoked
+
 		if revocationDate.Valid {
-			revTime, _ = time.Parse(time.RFC3339, revocationDate.String)
-		} else {
-			revTime = time.Now().UTC()
+			t, _ := time.Parse(time.RFC3339, revocationDate.String)
+			result.RevocationTime = &t
 		}
 
-		var reason *int
 		if revocationReason.Valid && revocationReason.String != "" {
+			reason := mapRevocationReason(revocationReason.String)
+			result.RevocationReason = &reason
 		}
-
-		return &ocsp.StatusResult{
-			Status:           ocsp.StatusRevoked,
-			RevocationTime:   &revTime,
-			RevocationReason: reason,
-			ThisUpdate:       time.Now().UTC(),
-		}, nil
 
 	default:
-		return &ocsp.StatusResult{
-			Status:     ocsp.StatusUnknown,
-			ThisUpdate: time.Now().UTC(),
-		}, nil
+		result.Status = ocsp.StatusUnknown
 	}
+
+	nextUpdate := time.Now().UTC().Add(24 * time.Hour)
+	result.NextUpdate = &nextUpdate
+
+	return result, nil
 }
 
 // GetIssuerByHashes возвращает сертификат издателя по хешам
 func (db *DB) GetIssuerByHashes(nameHash, keyHash []byte) (*x509.Certificate, error) {
 	intPath := filepath.Join(filepath.Dir(db.path), "intermediate", "certs", "intermediate.cert.pem")
 	if cert, err := certs.LoadCertificate(intPath); err == nil {
-		if match, _ := ocsp.VerifyCertID(&ocsp.CertID{
-			IssuerNameHash: nameHash,
-			IssuerKeyHash:  keyHash,
-		}, cert); match {
-			return cert, nil
-		}
+		return cert, nil
 	}
 
 	rootPath := filepath.Join(filepath.Dir(db.path), "root", "certs", "ca.cert.pem")
 	if cert, err := certs.LoadCertificate(rootPath); err == nil {
-		if match, _ := ocsp.VerifyCertID(&ocsp.CertID{
-			IssuerNameHash: nameHash,
-			IssuerKeyHash:  keyHash,
-		}, cert); match {
-			return cert, nil
-		}
+		return cert, nil
 	}
 
 	return nil, fmt.Errorf("издатель не найден")
@@ -621,11 +584,39 @@ func (db *DB) NewDatabaseStatusChecker() *DatabaseStatusChecker {
 }
 
 // GetCertificateStatus реализует интерфейс ocsp.StatusChecker
-func (c *DatabaseStatusChecker) GetCertificateStatus(issuerNameHash, issuerKeyHash []byte, serial *big.Int) (*ocsp.StatusResult, error) {
-	return c.db.GetCertificateStatusForOCSP(issuerNameHash, issuerKeyHash, serial)
+func (c *DatabaseStatusChecker) GetCertificateStatus(serialHex string) (*ocsp.StatusResult, error) {
+	return c.db.GetCertificateStatus(serialHex)
 }
 
 // GetIssuerByHashes реализует интерфейс ocsp.StatusChecker
 func (c *DatabaseStatusChecker) GetIssuerByHashes(nameHash, keyHash []byte) (*x509.Certificate, error) {
 	return c.db.GetIssuerByHashes(nameHash, keyHash)
+}
+
+// mapRevocationReason преобразует строку причины в код
+func mapRevocationReason(reason string) int {
+	switch reason {
+	case "unspecified":
+		return 0
+	case "keyCompromise":
+		return 1
+	case "cACompromise":
+		return 2
+	case "affiliationChanged":
+		return 3
+	case "superseded":
+		return 4
+	case "cessationOfOperation":
+		return 5
+	case "certificateHold":
+		return 6
+	case "removeFromCRL":
+		return 8
+	case "privilegeWithdrawn":
+		return 9
+	case "aACompromise":
+		return 10
+	default:
+		return 0
+	}
 }

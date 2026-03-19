@@ -7,7 +7,7 @@ package main
 import (
 	"bytes"
 	"context"
-	stdcrypto "crypto"
+	"crypto"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -30,9 +30,10 @@ import (
 	"micropki/micropki/internal/ca"
 	"micropki/micropki/internal/certs"
 	"micropki/micropki/internal/chain"
+	"micropki/micropki/internal/cli"
 	"micropki/micropki/internal/config"
 	"micropki/micropki/internal/crl"
-	"micropki/micropki/internal/crypto"
+	internalcrypto "micropki/micropki/internal/crypto"
 	"micropki/micropki/internal/database"
 	"micropki/micropki/internal/ocsp"
 	"micropki/micropki/internal/repository"
@@ -152,6 +153,11 @@ func run(args []string, logger *log.Logger) error {
 		default:
 			return fmt.Errorf("неизвестная подкоманда '%s' для 'ocsp'", args[1])
 		}
+	case "client":
+		if len(args) < 2 {
+			return fmt.Errorf("отсутствует подкоманда для 'client'\nИспользование: micropki-cli client <подкоманда> [опции]")
+		}
+		return cli.RunClient(args[1:], logger)
 	case "help", "--help", "-h":
 		printUsage()
 		return nil
@@ -188,6 +194,12 @@ func printUsage() {
 
 	fmt.Println("\nКоманды OCSP (Online Certificate Status Protocol):")
 	fmt.Println("  ocsp serve              Запуск OCSP-ответчика")
+
+	fmt.Println("\nКлиентские команды:")
+	fmt.Println("  client gen-csr          Генерация закрытого ключа и CSR")
+	fmt.Println("  client request-cert     Отправка CSR в УЦ и получение сертификата")
+	fmt.Println("  client validate         Проверка цепочки сертификатов")
+	fmt.Println("  client check-status     Проверка статуса отзыва сертификата")
 
 	fmt.Println("\nОбщие команды:")
 	fmt.Println("  help                    Показать эту справку")
@@ -300,6 +312,38 @@ func printUsage() {
 	fmt.Println("  --ca-cert           Путь к сертификату издателя (PEM) (обязательно)")
 	fmt.Println("  --cache-ttl         Время жизни кэша в секундах (по умолчанию: 60)")
 	fmt.Println("  --log-file          Файл для логов OCSP сервера")
+
+	fmt.Println("\nОпции для Client Gen-CSR:")
+	fmt.Println("  --subject           Различающееся имя (DN) для сертификата (обязательно)")
+	fmt.Println("  --key-type          Тип ключа: rsa или ecc (по умолчанию: rsa)")
+	fmt.Println("  --key-size          Размер ключа: для RSA 2048/4096, для ECC 256/384 (по умолчанию: 2048/256)")
+	fmt.Println("  --san               Альтернативные имена субъекта (можно несколько)")
+	fmt.Println("                      Формат: dns:example.com, ip:192.168.1.1, email:user@ex.com")
+	fmt.Println("  --out-key           Выходной файл для закрытого ключа (по умолчанию: ./key.pem)")
+	fmt.Println("  --out-csr           Выходной файл для CSR (по умолчанию: ./request.csr.pem)")
+
+	fmt.Println("\nОпции для Client Request-Cert:")
+	fmt.Println("  --csr               Путь к файлу CSR (PEM) (обязательно)")
+	fmt.Println("  --template          Шаблон сертификата: server, client, code_signing (обязательно)")
+	fmt.Println("  --ca-url            Базовый URL репозитория (например, http://localhost:8080) (обязательно)")
+	fmt.Println("  --out-cert          Выходной файл для сертификата (по умолчанию: ./cert.pem)")
+	fmt.Println("  --api-key           API ключ для аутентификации (опционально)")
+
+	fmt.Println("\nОпции для Client Validate:")
+	fmt.Println("  --cert              Путь к конечному сертификату (PEM) (обязательно)")
+	fmt.Println("  --untrusted         Промежуточные сертификаты (можно несколько)")
+	fmt.Println("  --trusted           Путь к доверенному корневому CA (по умолчанию: ./pki/certs/ca.cert.pem)")
+	fmt.Println("  --crl               Проверить CRL (локальный файл или URL) (опционально)")
+	fmt.Println("  --ocsp              Выполнить OCSP проверку (флаг)")
+	fmt.Println("  --mode              Режим: chain (только подпись/срок) или full (включая отзыв) (по умолч: full)")
+	fmt.Println("  --format            Формат вывода: text или json (по умолчанию: text)")
+	fmt.Println("  --validation-time   Время проверки, по умолчанию сейчас")
+
+	fmt.Println("\nОпции для Client Check-Status:")
+	fmt.Println("  --cert              Путь к сертификату (PEM) (обязательно)")
+	fmt.Println("  --ca-cert           Сертификат издателя (PEM) (обязательно)")
+	fmt.Println("  --crl               Опциональный CRL файл или URL")
+	fmt.Println("  --ocsp-url          Переопределить URL OCSP ответчика")
 }
 
 // ============================================================================
@@ -967,9 +1011,9 @@ func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger 
 		logger.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось прочитать парольную фразу из %s: %v", passFile, err)
 		return fmt.Errorf("не удалось прочитать парольную фразу: %w", err)
 	}
-	defer crypto.SecureZero(passphrase)
+	defer internalcrypto.SecureZero(passphrase)
 
-	caKey, err := crypto.LoadEncryptedPrivateKey(keyPath, passphrase)
+	caKey, err := internalcrypto.LoadEncryptedPrivateKey(keyPath, passphrase)
 	if err != nil {
 		return fmt.Errorf("не удалось загрузить закрытый ключ CA: %w", err)
 	}
@@ -1164,7 +1208,7 @@ func runCAInit(args []string, logger *log.Logger) error {
 	if err != nil {
 		return fmt.Errorf("не удалось прочитать парольную фразу: %w", err)
 	}
-	defer crypto.SecureZero(passphrase)
+	defer internalcrypto.SecureZero(passphrase)
 
 	if config.ValidityDays <= 0 {
 		return fmt.Errorf("--validity-days должен быть положительным числом, получено %d", config.ValidityDays)
@@ -1184,7 +1228,7 @@ func runCAInit(args []string, logger *log.Logger) error {
 	}
 
 	logger.Printf("INFO: Генерация ключевой пары %s...", config.KeyType)
-	keyPair, err := crypto.GenerateKeyPair(config.KeyType, config.KeySize)
+	keyPair, err := internalcrypto.GenerateKeyPair(config.KeyType, config.KeySize)
 	if err != nil {
 		return fmt.Errorf("ошибка генерации ключа: %w", err)
 	}
@@ -1222,7 +1266,7 @@ func runCAInit(args []string, logger *log.Logger) error {
 	privateKeyPath := filepath.Join(config.OutDir, "private", "ca.key.pem")
 	logger.Printf("INFO: Сохранение зашифрованного закрытого ключа в %s", privateKeyPath)
 
-	if err := crypto.SaveEncryptedPrivateKey(keyPair.PrivateKey, privateKeyPath, passphrase); err != nil {
+	if err := internalcrypto.SaveEncryptedPrivateKey(keyPair.PrivateKey, privateKeyPath, passphrase); err != nil {
 		return fmt.Errorf("не удалось сохранить закрытый ключ: %w", err)
 	}
 
@@ -1331,13 +1375,13 @@ func runCAIssueIntermediate(args []string, logger *log.Logger) error {
 	if err != nil {
 		return fmt.Errorf("не удалось прочитать парольную фразу корневого CA: %w", err)
 	}
-	defer crypto.SecureZero(rootPassphrase)
+	defer internalcrypto.SecureZero(rootPassphrase)
 
 	passphrase, err := readPassphraseFromFile(passphraseFile)
 	if err != nil {
 		return fmt.Errorf("не удалось прочитать парольную фразу: %w", err)
 	}
-	defer crypto.SecureZero(passphrase)
+	defer internalcrypto.SecureZero(passphrase)
 
 	parsedSubject, err := certs.ParseDN(subject)
 	if err != nil {
@@ -1480,7 +1524,7 @@ func runCAIssueCert(args []string, logger *log.Logger) error {
 	if err != nil {
 		return fmt.Errorf("не удалось прочитать парольную фразу CA: %w", err)
 	}
-	defer crypto.SecureZero(caPassphrase)
+	defer internalcrypto.SecureZero(caPassphrase)
 
 	var parsedSubject *pkix.Name
 	if subject != "" {
@@ -1930,12 +1974,19 @@ func runOCSPServe(args []string, logger *log.Logger) error {
 	if block == nil {
 		return fmt.Errorf("не удалось декодировать PEM ключа")
 	}
-	responderKeyObj, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+
+	var privateKey interface{}
+	privateKey, err = x509.ParsePKCS8PrivateKey(block.Bytes)
 	if err != nil {
-		responderKeyObj, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+		privateKey, err = x509.ParsePKCS1PrivateKey(block.Bytes)
 		if err != nil {
 			return fmt.Errorf("не удалось разобрать ключ: %w", err)
 		}
+	}
+
+	signer, ok := privateKey.(crypto.Signer)
+	if !ok {
+		return fmt.Errorf("ключ не поддерживает операцию подписи")
 	}
 
 	caCertObj, err := certs.LoadCertificate(caCert)
@@ -1953,7 +2004,7 @@ func runOCSPServe(args []string, logger *log.Logger) error {
 	responder := ocsp.NewResponder(&ocsp.ResponderConfig{
 		DB:            checker,
 		ResponderCert: responderCertObj,
-		ResponderKey:  responderKeyObj.(stdcrypto.PrivateKey),
+		ResponderKey:  signer,
 		IssuerCert:    caCertObj,
 		CacheTTL:      cacheTTL,
 		Logger:        ocspLogger,
@@ -2060,7 +2111,7 @@ func runCAIssueOCSPCert(args []string, logger *log.Logger) error {
 	if err != nil {
 		return fmt.Errorf("не удалось прочитать парольную фразу CA: %w", err)
 	}
-	defer crypto.SecureZero(caPassphrase)
+	defer internalcrypto.SecureZero(caPassphrase)
 
 	parsedSubject, err := certs.ParseDN(subject)
 	if err != nil {

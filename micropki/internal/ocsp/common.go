@@ -97,10 +97,10 @@ type Request struct {
 	Extensions    []pkix.Extension
 }
 
-// StatusChecker определяет интерфейс для проверки статуса сертификата
+// StatusChecker определяет интерфейс для проверки статуса сертификатов
 type StatusChecker interface {
-	GetCertificateStatus(issuerNameHash, issuerKeyHash []byte, serial *big.Int) (*StatusResult, error)
-	GetIssuerByHashes(issuerNameHash, issuerKeyHash []byte) (*x509.Certificate, error)
+	GetCertificateStatus(serialHex string) (*StatusResult, error)
+	GetIssuerByHashes(nameHash, keyHash []byte) (*x509.Certificate, error)
 }
 
 // StatusResult содержит результат проверки статуса сертификата
@@ -109,6 +109,7 @@ type StatusResult struct {
 	RevocationTime   *time.Time
 	RevocationReason *int
 	ThisUpdate       time.Time
+	NextUpdate       *time.Time
 }
 
 // ResponseConfig содержит параметры для формирования OCSP-ответа

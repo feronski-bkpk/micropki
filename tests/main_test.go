@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -278,11 +280,19 @@ func getCRLNumber(t *testing.T, crlPath string) string {
 	for _, line := range lines {
 		if strings.Contains(line, "CRL Number") {
 			parts := strings.Fields(line)
-			if len(parts) >= 4 {
-				return parts[3]
+			for i := len(parts) - 1; i >= 0; i-- {
+				if _, err := strconv.Atoi(parts[i]); err == nil {
+					return parts[i]
+				}
 			}
 		}
 	}
+
+	re := regexp.MustCompile(`CRL Number:\s*(\d+)`)
+	if matches := re.FindStringSubmatch(string(output)); len(matches) > 1 {
+		return matches[1]
+	}
+
 	return ""
 }
 
@@ -789,7 +799,6 @@ func TestHTTPCRLEndpoints(t *testing.T) {
 		cmd.Wait()
 	}()
 
-	t.Log("Waiting for server to start...")
 	time.Sleep(3 * time.Second)
 
 	if logContent, err := os.ReadFile(repoLog); err == nil {
