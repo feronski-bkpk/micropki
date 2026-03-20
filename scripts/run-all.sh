@@ -17,7 +17,8 @@ echo "Запуск OCSP responder на порту 8081..."
   --responder-cert ./pki/certs/ocsp.cert.pem \
   --responder-key ./pki/certs/ocsp.key.pem \
   --ca-cert ./pki/intermediate/certs/intermediate.cert.pem \
-  --cache-ttl 60 > ocsp.log 2>&1 &
+  --log-file ocsp.log \
+  --cache-ttl 60 > /dev/null 2>&1 &
 OCSP_PID=$!
 echo "OCSP responder запущен (PID: $OCSP_PID)"
 

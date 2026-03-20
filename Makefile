@@ -150,6 +150,7 @@ clean-temp:
 	@rm -f *.out *.html *.tmp
 	@rm -f $(COVERAGE_FILE) $(COVERAGE_HTML)
 	@rm -rf ./test-output
+	@rm -rf ./tests/test-output
 	@rm -rf ./test-certs
 	@rm -rf ./test-sprint3
 	@rm -rf ./test-pki

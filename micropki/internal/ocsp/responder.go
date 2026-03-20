@@ -1,6 +1,7 @@
 package ocsp
 
 import (
+	"context"
 	"crypto"
 	"crypto/x509"
 	"encoding/asn1"
@@ -9,8 +10,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -112,6 +116,17 @@ func (r *Responder) handleRequest(requestDER []byte, clientIP string) ([]byte, e
 
 	if err := req.Validate(); err != nil {
 		return nil, err
+	}
+
+	for _, entry := range req.RequestList {
+		serialHex := hex.EncodeToString(entry.CertID.SerialNumber.Bytes())
+
+		status, err := r.db.GetCertificateStatus(serialHex)
+		if err != nil {
+			r.logger.Printf("DB error: %v", err)
+		} else {
+			r.logger.Printf("DB status: %v", status.Status)
+		}
 	}
 
 	var serialHex string
@@ -216,4 +231,31 @@ func (r *Responder) logRequest(clientIP string, requestDER []byte, responseDER [
 
 	r.logger.Printf("INFO: client=%s method=OCSP status=%s serials=%v nonce=%s duration=%v",
 		clientIP, status, serials, nonceStr, duration)
+}
+
+// ListenAndServe запускает сервер и ждет сигнала остановки
+func (r *Responder) ListenAndServe(addr string) error {
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      r,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
+	}
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		r.logger.Println("Получен сигнал завершения, останавливаем OCSP-ответчик...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			r.logger.Printf("Ошибка при остановке сервера: %v", err)
+		}
+	}()
+
+	r.logger.Printf("Запуск OCSP-ответчика на %s", addr)
+	return server.ListenAndServe()
 }

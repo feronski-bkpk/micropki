@@ -45,42 +45,54 @@ type ocspRequest struct {
 	TBSRequest tbsRequest
 }
 
-// ParseRequest разбирает DER-encoded OCSP запрос
+// ParseRequest парсит DER-encoded OCSP запрос
 func ParseRequest(der []byte) (*Request, error) {
-	var req ocspRequest
-	_, err := asn1.Unmarshal(der, &req)
+	var rawRequest struct {
+		TBSRequest struct {
+			Version       int
+			RequestorName asn1.RawValue `asn1:"optional,explicit,tag:0"`
+			RequestList   []struct {
+				CertID struct {
+					HashAlgorithm  pkix.AlgorithmIdentifier
+					IssuerNameHash []byte
+					IssuerKeyHash  []byte
+					SerialNumber   asn1.RawValue
+				}
+				SingleExtensions []pkix.Extension `asn1:"optional,explicit,tag:0"`
+			}
+			RequestExtensions []pkix.Extension `asn1:"optional,explicit,tag:2"`
+		}
+		OptionalSignature asn1.RawValue `asn1:"optional,explicit,tag:0"`
+	}
+
+	rest, err := asn1.Unmarshal(der, &rawRequest)
 	if err != nil {
 		return nil, NewOCSPError(ResponseStatusMalformedRequest,
-			fmt.Sprintf("не удалось разобрать запрос: %v", err))
+			fmt.Sprintf("не удалось распарсить запрос: %v", err))
+	}
+	if len(rest) > 0 {
+		return nil, NewOCSPError(ResponseStatusMalformedRequest, "лишние данные после запроса")
 	}
 
-	if len(req.TBSRequest.RequestList.Requests) == 0 {
-		fmt.Printf("No certificates in request\n")
-		return nil, NewOCSPError(ResponseStatusMalformedRequest,
-			"запрос не содержит сертификатов")
+	req := &Request{
+		Version:    rawRequest.TBSRequest.Version,
+		Extensions: rawRequest.TBSRequest.RequestExtensions,
 	}
 
-	result := &Request{
-		Version:     req.TBSRequest.Version,
-		RequestList: make([]RequestEntry, len(req.TBSRequest.RequestList.Requests)),
-		Extensions:  []pkix.Extension{},
-	}
-
-	for i, entry := range req.TBSRequest.RequestList.Requests {
-		result.RequestList[i] = RequestEntry{
+	for _, rawEntry := range rawRequest.TBSRequest.RequestList {
+		entry := RequestEntry{
 			CertID: CertID{
-				HashAlgorithm: pkix.AlgorithmIdentifier{
-					Algorithm: entry.ReqCert.CertID.HashAlgorithm.Algorithm,
-				},
-				IssuerNameHash: entry.ReqCert.CertID.IssuerNameHash,
-				IssuerKeyHash:  entry.ReqCert.CertID.IssuerKeyHash,
-				SerialNumber:   entry.ReqCert.CertID.SerialNumber,
+				HashAlgorithm:  rawEntry.CertID.HashAlgorithm,
+				IssuerNameHash: rawEntry.CertID.IssuerNameHash,
+				IssuerKeyHash:  rawEntry.CertID.IssuerKeyHash,
+				SerialNumber:   new(big.Int).SetBytes(rawEntry.CertID.SerialNumber.Bytes),
 			},
+			Extensions: rawEntry.SingleExtensions,
 		}
-		fmt.Printf("  CertID %d: Serial=%X\n", i, entry.ReqCert.CertID.SerialNumber)
+		req.RequestList = append(req.RequestList, entry)
 	}
 
-	return result, nil
+	return req, nil
 }
 
 // GetNonce извлекает nonce из расширений запроса

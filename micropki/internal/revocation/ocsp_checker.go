@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"sync"
 	"time"
@@ -29,65 +30,6 @@ type OCSPCacheEntry struct {
 	result       *RevocationResult
 	fetchedAt    time.Time
 	responderURL string
-}
-
-// OCSPRequest представляет OCSP запрос (упрощённо)
-type ocspRequest struct {
-	TBSRequest tbsRequest
-}
-
-type tbsRequest struct {
-	Version           int
-	RequestorName     asn1.RawValue `asn1:"optional,explicit,tag:0"`
-	RequestList       []request
-	RequestExtensions []pkix.Extension `asn1:"optional,explicit,tag:2"`
-}
-
-type request struct {
-	CertID                  certID
-	SingleRequestExtensions []pkix.Extension `asn1:"optional,explicit,tag:0"`
-}
-
-type certID struct {
-	HashAlgorithm pkix.AlgorithmIdentifier
-	NameHash      []byte
-	KeyHash       []byte
-	SerialNumber  asn1.RawValue
-}
-
-// OCSPResponse представляет ответ OCSP
-type ocspResponse struct {
-	ResponseStatus int
-	ResponseBytes  responseBytes `asn1:"optional,explicit,tag:0"`
-}
-
-type responseBytes struct {
-	ResponseType asn1.ObjectIdentifier
-	Response     []byte
-}
-
-// basicOCSPResponse представляет базовый ответ OCSP
-type basicOCSPResponse struct {
-	TBSResponseData    tbsResponseData
-	SignatureAlgorithm pkix.AlgorithmIdentifier
-	Signature          asn1.BitString
-	Certs              []asn1.RawValue `asn1:"optional"`
-}
-
-type tbsResponseData struct {
-	Version            int
-	ResponderID        asn1.RawValue
-	ProducedAt         time.Time
-	Responses          []singleResponse
-	ResponseExtensions []pkix.Extension `asn1:"optional,explicit,tag:1"`
-}
-
-type singleResponse struct {
-	CertID           certID
-	CertStatus       asn1.RawValue
-	ThisUpdate       time.Time
-	NextUpdate       time.Time        `asn1:"optional"`
-	SingleExtensions []pkix.Extension `asn1:"optional,explicit,tag:1"`
 }
 
 // NewOCSPChecker создает новый OCSP проверяльщик
@@ -164,7 +106,29 @@ func (oc *OCSPChecker) Check(cert, issuer *x509.Certificate) *RevocationResult {
 	return result
 }
 
-// buildOCSPRequest создает OCSP запрос
+// Структуры ASN.1 для OCSP запроса согласно RFC 6960
+type ocspCertID struct {
+	HashAlgorithm  pkix.AlgorithmIdentifier
+	IssuerNameHash []byte
+	IssuerKeyHash  []byte
+	SerialNumber   asn1.RawValue
+}
+
+type ocspRequest struct {
+	TBSRequest tbsRequest
+}
+
+type tbsRequest struct {
+	Version       int
+	RequestorName asn1.RawValue `asn1:"optional,explicit,tag:0"`
+	RequestList   []request
+}
+
+type request struct {
+	CertID asn1.RawValue
+}
+
+// buildOCSPRequest создает OCSP запрос согласно RFC 6960
 func (oc *OCSPChecker) buildOCSPRequest(cert, issuer *x509.Certificate) ([]byte, error) {
 	hash := sha1.New()
 	hash.Write(issuer.RawSubject)
@@ -173,32 +137,65 @@ func (oc *OCSPChecker) buildOCSPRequest(cert, issuer *x509.Certificate) ([]byte,
 	hash.Reset()
 	pubKeyDER, err := x509.MarshalPKIXPublicKey(issuer.PublicKey)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("не удалось маршалировать публичный ключ: %w", err)
 	}
 	hash.Write(pubKeyDER)
 	keyHash := hash.Sum(nil)
 
-	certID := certID{
+	certID := ocspCertID{
 		HashAlgorithm: pkix.AlgorithmIdentifier{
 			Algorithm: asn1.ObjectIdentifier{1, 3, 14, 3, 2, 26},
 		},
-		NameHash:     nameHash,
-		KeyHash:      keyHash,
-		SerialNumber: asn1.RawValue{Bytes: cert.SerialNumber.Bytes()},
+		IssuerNameHash: nameHash,
+		IssuerKeyHash:  keyHash,
+		SerialNumber:   asn1.RawValue{Bytes: cert.SerialNumber.Bytes()},
+	}
+
+	certIDDER, err := asn1.Marshal(certID)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось маршалировать CertID: %w", err)
 	}
 
 	req := ocspRequest{
 		TBSRequest: tbsRequest{
-			Version: 0,
-			RequestList: []request{
-				{
-					CertID: certID,
-				},
-			},
+			Version:     0,
+			RequestList: []request{{CertID: asn1.RawValue{FullBytes: certIDDER}}},
 		},
 	}
 
 	return asn1.Marshal(req)
+}
+
+// Структуры для парсинга OCSP ответа - синхронизированы с сервером
+type ocspResponse struct {
+	ResponseStatus int
+	ResponseBytes  struct {
+		ResponseType asn1.ObjectIdentifier
+		Response     []byte
+	} `asn1:"optional,explicit,tag:0"`
+}
+
+type basicOCSPResponse struct {
+	TBSResponseData    []byte
+	SignatureAlgorithm pkix.AlgorithmIdentifier
+	Signature          asn1.BitString
+	Certs              []asn1.RawValue `asn1:"optional,explicit,tag:0"`
+}
+
+type tbsResponseData struct {
+	Version            int
+	ResponderID        asn1.RawValue
+	ProducedAt         time.Time
+	Responses          []singleResponse
+	ResponseExtensions []pkix.Extension `asn1:"optional,explicit,tag:1"`
+}
+
+type singleResponse struct {
+	CertID           asn1.RawValue
+	CertStatus       asn1.RawValue
+	ThisUpdate       time.Time
+	NextUpdate       time.Time        `asn1:"optional,explicit,tag:0"`
+	SingleExtensions []pkix.Extension `asn1:"optional,explicit,tag:1"`
 }
 
 // sendOCSPRequest отправляет OCSP запрос
@@ -230,10 +227,10 @@ func (oc *OCSPChecker) parseOCSPResponse(resp []byte, cert, issuer *x509.Certifi
 	var ocspResp ocspResponse
 	rest, err := asn1.Unmarshal(resp, &ocspResp)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("не удалось распарсить OCSP ответ: %w", err)
 	}
 	if len(rest) > 0 {
-		return nil, fmt.Errorf("лишние данные после ответа")
+		return nil, fmt.Errorf("лишние данные после OCSP ответа")
 	}
 
 	if ocspResp.ResponseStatus != 0 {
@@ -246,17 +243,28 @@ func (oc *OCSPChecker) parseOCSPResponse(resp []byte, cert, issuer *x509.Certifi
 	var basic basicOCSPResponse
 	_, err = asn1.Unmarshal(ocspResp.ResponseBytes.Response, &basic)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("не удалось распарсить BasicOCSPResponse: %w", err)
 	}
 
-	for _, single := range basic.TBSResponseData.Responses {
-		var serialNum int
-		_, err := asn1.Unmarshal(single.CertID.SerialNumber.FullBytes, &serialNum)
+	var tbs tbsResponseData
+	_, err = asn1.Unmarshal(basic.TBSResponseData, &tbs)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось распарсить TBSResponseData: %w", err)
+	}
+
+	for _, single := range tbs.Responses {
+		var certID ocspCertID
+		_, err := asn1.Unmarshal(single.CertID.FullBytes, &certID)
 		if err != nil {
 			continue
 		}
 
-		if single.CertStatus.Bytes == nil {
+		respSerial := new(big.Int).SetBytes(certID.SerialNumber.Bytes)
+		if respSerial.Cmp(cert.SerialNumber) != 0 {
+			continue
+		}
+
+		if single.CertStatus.Tag == asn1.TagNull {
 			return &RevocationResult{
 				Status: StatusGood,
 			}, nil
@@ -274,6 +282,9 @@ func (oc *OCSPChecker) parseOCSPResponse(resp []byte, cert, issuer *x509.Certifi
 					RevocationReason: &reason,
 				}, nil
 			}
+			return &RevocationResult{
+				Status: StatusRevoked,
+			}, nil
 		} else {
 			return &RevocationResult{
 				Status: StatusUnknown,

@@ -2039,7 +2039,7 @@ func runOCSPServe(args []string, logger *log.Logger) error {
 	ocspLogger.Printf("Сертификат издателя: %s", caCert)
 	ocspLogger.Printf("Кэш TTL: %d секунд", cacheTTL)
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := responder.ListenAndServe(addr); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("ошибка сервера: %w", err)
 	}
 
