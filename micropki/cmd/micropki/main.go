@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto"
@@ -24,21 +25,31 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"micropki/micropki/internal/audit"
 	"micropki/micropki/internal/ca"
 	"micropki/micropki/internal/certs"
 	"micropki/micropki/internal/chain"
 	"micropki/micropki/internal/cli"
+	"micropki/micropki/internal/compromise"
 	"micropki/micropki/internal/config"
 	"micropki/micropki/internal/crl"
 	internalcrypto "micropki/micropki/internal/crypto"
+	"micropki/micropki/internal/csr"
 	"micropki/micropki/internal/database"
 	"micropki/micropki/internal/ocsp"
 	"micropki/micropki/internal/repository"
 	"micropki/micropki/internal/serial"
 	"micropki/micropki/internal/templates"
+)
+
+var (
+	globalAuditLogger *audit.AuditLogger
+	auditInitialized  = false
+	auditMutex        sync.Mutex
 )
 
 const (
@@ -85,6 +96,10 @@ func main() {
 // подкоманду. Возвращает ошибку, если команда не распознана или её выполнение
 // завершилось неудачей.
 func run(args []string, logger *log.Logger) error {
+	if err := initAudit("./pki", logger); err != nil {
+		logger.Printf("ПРЕДУПРЕЖДЕНИЕ: %v", err)
+	}
+
 	if len(args) < 1 {
 		printUsage()
 		return nil
@@ -118,6 +133,8 @@ func run(args []string, logger *log.Logger) error {
 			return runCAGenCRL(args[2:], logger)
 		case "check-revoked":
 			return runCACheckRevoked(args[2:], logger)
+		case "compromise":
+			return runCACompromise(args[2:], logger)
 		default:
 			return fmt.Errorf("неизвестная подкоманда '%s' для 'ca'", args[1])
 		}
@@ -153,6 +170,30 @@ func run(args []string, logger *log.Logger) error {
 		default:
 			return fmt.Errorf("неизвестная подкоманда '%s' для 'ocsp'", args[1])
 		}
+	case "audit":
+		if len(args) < 2 {
+			return fmt.Errorf("отсутствует подкоманда для 'audit'")
+		}
+		switch args[1] {
+		case "query":
+			return runAuditQuery(args[2:], logger)
+		case "verify":
+			return runAuditVerify(args[2:], logger)
+		case "detect-anomalies":
+			return runAuditDetectAnomalies(args[2:], logger)
+		default:
+			return fmt.Errorf("неизвестная подкоманда '%s' для 'audit'", args[1])
+		}
+	case "test":
+		if len(args) < 2 {
+			return fmt.Errorf("отсутствует подкоманда для 'test'\nИспользование: micropki-cli test <подкоманда> [опции]")
+		}
+		switch args[1] {
+		case "rsa-1024":
+			return runTestRSA1024(args[2:], logger)
+		default:
+			return fmt.Errorf("неизвестная подкоманда '%s' для 'test'", args[1])
+		}
 	case "client":
 		if len(args) < 2 {
 			return fmt.Errorf("отсутствует подкоманда для 'client'\nИспользование: micropki-cli client <подкоманда> [опции]")
@@ -184,12 +225,20 @@ func printUsage() {
 	fmt.Println("  ca revoke <serial>      Отзыв сертификата")
 	fmt.Println("  ca gen-crl              Генерация CRL для указанного CA")
 	fmt.Println("  ca check-revoked <serial> Проверка статуса отзыва сертификата")
+	fmt.Println("  ca compromise           Симуляция компрометации закрытого ключа")
+
+	fmt.Println("\nКоманды Аудита:")
+	fmt.Println("  audit query             Поиск и отображение записей журнала аудита")
+	fmt.Println("  audit verify            Проверка целостности журнала аудита")
+	fmt.Println("  audit detect-anomalies  Анализ аномалий в журнале аудита")
 
 	fmt.Println("\nКоманды Базы данных:")
 	fmt.Println("  db init                 Инициализация базы данных SQLite")
 
 	fmt.Println("\nКоманды Репозитория (HTTP сервер):")
 	fmt.Println("  repo serve              Запуск HTTP сервера репозитория")
+	fmt.Println("      --rate-limit          Запросов в секунду на клиентский IP (0 = отключено)")
+	fmt.Println("      --rate-burst          Допустимый всплеск запросов (по умолчанию: 10)")
 	fmt.Println("  repo status             Проверка статуса сервера репозитория")
 
 	fmt.Println("\nКоманды OCSP (Online Certificate Status Protocol):")
@@ -200,6 +249,9 @@ func printUsage() {
 	fmt.Println("  client request-cert     Отправка CSR в УЦ и получение сертификата")
 	fmt.Println("  client validate         Проверка цепочки сертификатов")
 	fmt.Println("  client check-status     Проверка статуса отзыва сертификата")
+
+	fmt.Println("\nКоманды тестирования:")
+	fmt.Println("  test rsa-1024           Проверка блокировки RSA-1024 ключа")
 
 	fmt.Println("\nОбщие команды:")
 	fmt.Println("  help                    Показать эту справку")
@@ -297,6 +349,8 @@ func printUsage() {
 	fmt.Println("  --cert-dir          Директория с сертификатами CA (по умолчанию: ./pki/certs)")
 	fmt.Println("  --log-file          Файл для логов HTTP сервера")
 	fmt.Println("  --config            Путь к конфигурационному файлу (YAML/JSON)")
+	fmt.Println("  --rate-limit        Запросов в секунду на клиентский IP (0 = отключено)")
+	fmt.Println("  --rate-burst        Допустимый всплеск запросов (по умолчанию: 10)")
 	fmt.Println("  --enable-ocsp       Опционально: включить OCSP-эндпоинт на /ocsp")
 	fmt.Println("  --ocsp-port         Порт для OCSP-ответчика (если отдельный процесс)")
 
@@ -344,6 +398,27 @@ func printUsage() {
 	fmt.Println("  --ca-cert           Сертификат издателя (PEM) (обязательно)")
 	fmt.Println("  --crl               Опциональный CRL файл или URL")
 	fmt.Println("  --ocsp-url          Переопределить URL OCSP ответчика")
+
+	fmt.Println("\nОпции для Audit Query:")
+	fmt.Println("  --from              Начальная временная метка (ISO 8601)")
+	fmt.Println("  --to                Конечная временная метка (ISO 8601)")
+	fmt.Println("  --level             Уровень журнала (INFO, WARNING, ERROR, AUDIT)")
+	fmt.Println("  --operation         Фильтр по типу операции")
+	fmt.Println("  --serial            Фильтр по серийному номеру")
+	fmt.Println("  --format            Формат вывода: table, json, csv (по умолчанию: table)")
+	fmt.Println("  --verify            Проверить целостность цепочки хешей")
+	fmt.Println("  --log-file          Путь к журналу аудита (по умолчанию: ./pki/audit/audit.log)")
+
+	fmt.Println("\nОпции для Audit Verify:")
+	fmt.Println("  --log-file          Путь к журналу аудита (по умолчанию: ./pki/audit/audit.log)")
+	fmt.Println("  --chain-file        Путь к файлу цепочки хешей (по умолчанию: ./pki/audit/chain.dat)")
+
+	fmt.Println("\nОпции для CA Compromise:")
+	fmt.Println("  --cert              Путь к сертификату (PEM) (обязательно)")
+	fmt.Println("  --reason            Причина компрометации (по умолчанию: keyCompromise)")
+	fmt.Println("  --force             Пропустить подтверждение")
+	fmt.Println("  --db-path           Путь к базе данных SQLite (по умолчанию: ./pki/micropki.db)")
+	fmt.Println("  --out-dir           Выходная директория (по умолчанию: ./pki)")
 }
 
 // ============================================================================
@@ -724,6 +799,8 @@ func runRepoServe(args []string, logger *log.Logger) error {
 		certDir    string
 		logFile    string
 		configPath string
+		rateLimit  float64
+		rateBurst  int
 	)
 
 	cmd.StringVar(&host, "host", "127.0.0.1", "Адрес для прослушивания")
@@ -732,6 +809,8 @@ func runRepoServe(args []string, logger *log.Logger) error {
 	cmd.StringVar(&certDir, "cert-dir", "./pki/certs", "Директория с сертификатами CA")
 	cmd.StringVar(&logFile, "log-file", "", "Файл для логов HTTP сервера")
 	cmd.StringVar(&configPath, "config", "", "Путь к конфигурационному файлу")
+	cmd.Float64Var(&rateLimit, "rate-limit", 0, "Запросов в секунду на клиентский IP (0 = отключено)")
+	cmd.IntVar(&rateBurst, "rate-burst", 10, "Допустимый всплеск запросов")
 
 	if err := cmd.Parse(args); err != nil {
 		return err
@@ -758,11 +837,13 @@ func runRepoServe(args []string, logger *log.Logger) error {
 	}
 
 	serverCfg := &repository.Config{
-		Host:    host,
-		Port:    port,
-		DBPath:  dbPath,
-		CertDir: certDir,
-		LogFile: logFile,
+		Host:      host,
+		Port:      port,
+		DBPath:    dbPath,
+		CertDir:   certDir,
+		LogFile:   logFile,
+		RateLimit: rateLimit,
+		RateBurst: rateBurst,
 	}
 
 	server, err := repository.NewServer(serverCfg)
@@ -981,15 +1062,13 @@ func generateCRLForCA(dbPath, outDir, caName string, nextUpdateDays int, logger 
 
 	switch caName {
 	case "root":
-		certPath = filepath.Join(outDir, "root", "certs", "ca.cert.pem")
-		keyPath = filepath.Join(outDir, "root", "private", "ca.key.pem")
+		certPath = filepath.Join(outDir, "certs", "ca.cert.pem")
+		keyPath = filepath.Join(outDir, "private", "ca.key.pem")
 		passFile = filepath.Join(outDir, "root-pass.txt")
 	case "intermediate":
-		certPath = filepath.Join(outDir, "intermediate", "certs", "intermediate.cert.pem")
-		keyPath = filepath.Join(outDir, "intermediate", "private", "intermediate.key.pem")
+		certPath = filepath.Join(outDir, "certs", "intermediate.cert.pem")
+		keyPath = filepath.Join(outDir, "private", "intermediate.key.pem")
 		passFile = filepath.Join(outDir, "int-pass.txt")
-	default:
-		return fmt.Errorf("неизвестное имя CA: %s", caName)
 	}
 
 	if _, err := os.Stat(certPath); err != nil {
@@ -1314,6 +1393,7 @@ func runCAIssueIntermediate(args []string, logger *log.Logger) error {
 		rootKeyPath    string
 		rootPassFile   string
 		subject        string
+		sans           arrayFlags
 		keyType        string
 		keySize        int
 		passphraseFile string
@@ -1327,6 +1407,7 @@ func runCAIssueIntermediate(args []string, logger *log.Logger) error {
 	cmd.StringVar(&rootKeyPath, "root-key", "", "Путь к зашифрованному закрытому ключу корневого CA (PEM)")
 	cmd.StringVar(&rootPassFile, "root-pass-file", "", "Файл с парольной фразой для ключа корневого CA")
 	cmd.StringVar(&subject, "subject", "", "Различающееся имя для промежуточного CA")
+	cmd.Var(&sans, "san", "Альтернативные имена субъекта (можно указывать несколько раз)")
 	cmd.StringVar(&keyType, "key-type", "rsa", "Тип ключа: rsa или ecc")
 	cmd.IntVar(&keySize, "key-size", 0, "Размер ключа: 4096 для RSA, 384 для ECC")
 	cmd.StringVar(&passphraseFile, "passphrase-file", "", "Парольная фраза для ключа промежуточного CA")
@@ -1371,6 +1452,15 @@ func runCAIssueIntermediate(args []string, logger *log.Logger) error {
 		return fmt.Errorf("размер ECC ключа должен быть 384")
 	}
 
+	var parsedSANs []templates.SAN
+	for _, san := range sans {
+		parsed, err := templates.ParseSANString(san)
+		if err != nil {
+			return fmt.Errorf("неверный SAN '%s': %w", san, err)
+		}
+		parsedSANs = append(parsedSANs, parsed)
+	}
+
 	rootPassphrase, err := readPassphraseFromFile(rootPassFile)
 	if err != nil {
 		return fmt.Errorf("не удалось прочитать парольную фразу корневого CA: %w", err)
@@ -1394,6 +1484,9 @@ func runCAIssueIntermediate(args []string, logger *log.Logger) error {
 
 	logger.Printf("INFO: Запуск выпуска промежуточного CA")
 	logger.Printf("INFO: Субъект: %s", subject)
+	if len(parsedSANs) > 0 {
+		logger.Printf("INFO: SAN: %v", parsedSANs)
+	}
 	logger.Printf("INFO: Тип ключа: %s-%d", keyType, keySize)
 	logger.Printf("INFO: Срок действия: %d дней, PathLen: %d", validityDays, pathLen)
 
@@ -1406,12 +1499,14 @@ func runCAIssueIntermediate(args []string, logger *log.Logger) error {
 		RootKeyPath:    rootKeyPath,
 		RootPassphrase: rootPassphrase,
 		Subject:        parsedSubject,
+		SANs:           parsedSANs,
 		KeyType:        keyType,
 		KeySize:        keySize,
 		Passphrase:     passphrase,
 		OutDir:         outDir,
 		ValidityDays:   validityDays,
 		PathLen:        pathLen,
+		AuditLogger:    globalAuditLogger,
 	}
 
 	if err := ca.IssueIntermediate(cfg); err != nil {
@@ -1572,6 +1667,8 @@ func runCAIssueCert(args []string, logger *log.Logger) error {
 		ValidityDays: validityDays,
 		KeyType:      keyType,
 		KeySize:      keySize,
+		DBPath:       dbPath,
+		AuditLogger:  globalAuditLogger,
 	}
 
 	if err := ca.IssueCertificate(cfg); err != nil {
@@ -2148,6 +2245,504 @@ func runCAIssueOCSPCert(args []string, logger *log.Logger) error {
 
 	if err := ocsp.IssueOCSPCertificate(config); err != nil {
 		return fmt.Errorf("не удалось выпустить OCSP-сертификат: %w", err)
+	}
+
+	return nil
+}
+
+// readAuditLog читает журнал аудита и возвращает список записей
+func readAuditLog(logPath string) ([]audit.LogEntry, error) {
+	file, err := os.Open(logPath)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось открыть журнал аудита: %w", err)
+	}
+	defer file.Close()
+
+	var entries []audit.LogEntry
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		var entry audit.LogEntry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("ошибка чтения журнала: %w", err)
+	}
+
+	return entries, nil
+}
+
+// filterAuditEntries фильтрует записи аудита по заданным критериям
+func filterAuditEntries(entries []audit.LogEntry, fromTime, toTime, level, operation, serial string) []audit.LogEntry {
+	var filtered []audit.LogEntry
+
+	for _, entry := range entries {
+		if fromTime != "" || toTime != "" {
+			t, err := time.Parse(time.RFC3339Nano, entry.Timestamp)
+			if err != nil {
+				continue
+			}
+
+			if fromTime != "" {
+				from, err := time.Parse(time.RFC3339Nano, fromTime)
+				if err == nil && t.Before(from) {
+					continue
+				}
+			}
+
+			if toTime != "" {
+				to, err := time.Parse(time.RFC3339Nano, toTime)
+				if err == nil && t.After(to) {
+					continue
+				}
+			}
+		}
+
+		if level != "" && strings.ToUpper(string(entry.Level)) != strings.ToUpper(level) {
+			continue
+		}
+
+		if operation != "" && !strings.Contains(strings.ToLower(entry.Operation), strings.ToLower(operation)) {
+			continue
+		}
+
+		if serial != "" {
+			if metaSerial, ok := entry.Metadata["serial"]; ok {
+				if !strings.Contains(strings.ToLower(fmt.Sprint(metaSerial)), strings.ToLower(serial)) {
+					continue
+				}
+			} else {
+				continue
+			}
+		}
+
+		filtered = append(filtered, entry)
+	}
+
+	return filtered
+}
+
+// outputAuditTable выводит записи аудита в табличном формате
+func outputAuditTable(entries []audit.LogEntry) error {
+	fmt.Println("\n=== Журнал аудита ===")
+	fmt.Println(strings.Repeat("-", 120))
+	fmt.Printf("%-30s %-10s %-20s %-15s %-40s\n",
+		"Timestamp", "Level", "Operation", "Status", "Message")
+	fmt.Println(strings.Repeat("-", 120))
+
+	for _, entry := range entries {
+		timestamp := entry.Timestamp
+		if len(timestamp) > 30 {
+			timestamp = timestamp[:30]
+		}
+
+		message := entry.Message
+		if len(message) > 40 {
+			message = message[:37] + "..."
+		}
+
+		fmt.Printf("%-30s %-10s %-20s %-15s %-40s\n",
+			timestamp,
+			entry.Level,
+			entry.Operation,
+			entry.Status,
+			message,
+		)
+	}
+
+	fmt.Println(strings.Repeat("-", 120))
+	fmt.Printf("Всего записей: %d\n", len(entries))
+
+	return nil
+}
+
+// outputAuditJSON выводит записи аудита в JSON формате
+func outputAuditJSON(entries []audit.LogEntry) error {
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(entries)
+}
+
+// outputAuditCSV выводит записи аудита в CSV формате
+func outputAuditCSV(entries []audit.LogEntry) error {
+	fmt.Println("timestamp,level,operation,status,message")
+
+	for _, entry := range entries {
+		fmt.Printf("%s,%s,%s,%s,\"%s\"\n",
+			entry.Timestamp,
+			entry.Level,
+			entry.Operation,
+			entry.Status,
+			strings.ReplaceAll(entry.Message, "\"", "\"\""),
+		)
+	}
+
+	return nil
+}
+
+// runAuditQuery обрабатывает подкоманду 'audit query'
+func runAuditQuery(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("audit-query", flag.ContinueOnError)
+
+	var (
+		fromTime  string
+		toTime    string
+		level     string
+		operation string
+		serial    string
+		format    string
+		verify    bool
+		logPath   string
+	)
+
+	cmd.StringVar(&fromTime, "from", "", "Начальная временная метка (ISO 8601)")
+	cmd.StringVar(&toTime, "to", "", "Конечная временная метка (ISO 8601)")
+	cmd.StringVar(&level, "level", "", "Уровень журнала (INFO, WARNING, ERROR, AUDIT)")
+	cmd.StringVar(&operation, "operation", "", "Фильтр по типу операции")
+	cmd.StringVar(&serial, "serial", "", "Фильтр по серийному номеру")
+	cmd.StringVar(&format, "format", "table", "Формат вывода: table, json, csv")
+	cmd.BoolVar(&verify, "verify", false, "Проверить целостность цепочки хешей")
+	cmd.StringVar(&logPath, "log-file", "./pki/audit/audit.log", "Путь к журналу аудита")
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	if verify {
+		chainPath := strings.Replace(logPath, "audit.log", "chain.dat", 1)
+		result, err := audit.VerifyChain(logPath, chainPath)
+		if err != nil {
+			return fmt.Errorf("ошибка проверки целостности: %w", err)
+		}
+		if !result.Valid {
+			fmt.Printf("ПРЕДУПРЕЖДЕНИЕ: Нарушение целостности журнала аудита!\n")
+			fmt.Printf("  %s\n", result.ErrorMessage)
+			if result.FirstCorrupted > 0 {
+				fmt.Printf("  Первое повреждение в записи: %d\n", result.FirstCorrupted)
+			}
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Целостность журнала подтверждена\n\n")
+	}
+
+	entries, err := readAuditLog(logPath)
+	if err != nil {
+		return err
+	}
+
+	filtered := filterAuditEntries(entries, fromTime, toTime, level, operation, serial)
+
+	switch strings.ToLower(format) {
+	case "json":
+		return outputAuditJSON(filtered)
+	case "csv":
+		return outputAuditCSV(filtered)
+	default: // table
+		return outputAuditTable(filtered)
+	}
+}
+
+// runAuditVerify обрабатывает подкоманду 'audit verify'
+func runAuditVerify(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("audit-verify", flag.ContinueOnError)
+
+	var (
+		logPath   string
+		chainPath string
+	)
+
+	cmd.StringVar(&logPath, "log-file", "./pki/audit/audit.log", "Путь к журналу аудита")
+	cmd.StringVar(&chainPath, "chain-file", "./pki/audit/chain.dat", "Путь к файлу цепочки хешей")
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	result, err := audit.VerifyChain(logPath, chainPath)
+	if err != nil {
+		return fmt.Errorf("ошибка проверки цепочки: %w", err)
+	}
+
+	fmt.Println("=== Проверка целостности журнала аудита ===")
+	fmt.Printf("Всего записей: %d\n", result.TotalEntries)
+
+	if result.Valid {
+		fmt.Printf("✓ Статус: ЦЕЛОСТНОСТЬ ПОДТВЕРЖДЕНА\n")
+		fmt.Printf("Последний хеш: %s\n", result.LastValidHash)
+		return nil
+	}
+
+	fmt.Printf("✗ Статус: НАРУШЕНИЕ ЦЕЛОСТНОСТИ\n")
+	fmt.Printf("Ошибка: %s\n", result.ErrorMessage)
+	if result.FirstCorrupted > 0 {
+		fmt.Printf("Первое повреждение: запись %d\n", result.FirstCorrupted)
+	}
+
+	os.Exit(1)
+	return nil
+}
+
+// runCACompromise обрабатывает подкоманду 'ca compromise'
+func runCACompromise(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("ca-compromise", flag.ContinueOnError)
+
+	var (
+		certPath string
+		reason   string
+		force    bool
+		dbPath   string
+		outDir   string
+	)
+
+	cmd.StringVar(&certPath, "cert", "", "Путь к сертификату (PEM)")
+	cmd.StringVar(&reason, "reason", "keyCompromise", "Причина компрометации")
+	cmd.BoolVar(&force, "force", false, "Пропустить подтверждение")
+	cmd.StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к базе данных")
+	cmd.StringVar(&outDir, "out-dir", "./pki", "Выходная директория")
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	if certPath == "" {
+		return fmt.Errorf("--cert обязателен")
+	}
+
+	if !force {
+		fmt.Printf("Вы уверены, что хотите отметить сертификат %s как скомпрометированный? (y/N): ", certPath)
+		var response string
+		fmt.Scanln(&response)
+		if response != "y" && response != "Y" {
+			fmt.Println("Операция отменена")
+			return nil
+		}
+	}
+
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return fmt.Errorf("не удалось прочитать сертификат: %w", err)
+	}
+
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return fmt.Errorf("не удалось декодировать сертификат")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("не удалось разобрать сертификат: %w", err)
+	}
+
+	db, err := database.New(dbPath)
+	if err != nil {
+		return fmt.Errorf("не удалось подключиться к БД: %w", err)
+	}
+	defer db.Close()
+
+	serialHex := hex.EncodeToString(cert.SerialNumber.Bytes())
+	reasonCode, _ := crl.ParseReasonCode(reason)
+
+	revokeMgr := crl.NewRevocationManager(db.DB, filepath.Join(outDir, "crl"))
+	if err := revokeMgr.RevokeCertificate(serialHex, reasonCode); err != nil {
+		return fmt.Errorf("не удалось отозвать сертификат: %w", err)
+	}
+
+	compMgr := compromise.NewCompromiseManager(db, logger)
+	if err := compMgr.MarkKeyCompromised(cert, reason); err != nil {
+		logger.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось отметить ключ как скомпрометированный: %v", err)
+	}
+
+	logger.Printf("Генерация экстренного CRL...")
+	caName := "intermediate"
+	if strings.Contains(cert.Issuer.String(), "Root") {
+		caName = "root"
+	}
+
+	if err := generateCRLForCA(dbPath, outDir, caName, 7, logger); err != nil {
+		logger.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось сгенерировать экстренный CRL: %v", err)
+	} else {
+		fmt.Printf("✓ Экстренный CRL сгенерирован\n")
+	}
+
+	if globalAuditLogger != nil {
+		globalAuditLogger.Log(audit.LevelAudit, "key_compromise", "success",
+			fmt.Sprintf("Ключ сертификата %s отмечен как скомпрометированный", serialHex),
+			map[string]interface{}{
+				"serial":    serialHex,
+				"subject":   cert.Subject.String(),
+				"reason":    reason,
+				"cert_path": certPath,
+			})
+	}
+
+	fmt.Printf("\n✓ Сертификат %X отозван как скомпрометированный\n", cert.SerialNumber)
+	fmt.Printf("  Причина: %s\n", reason)
+	fmt.Printf("  Серийный номер: %s\n", serialHex)
+
+	return nil
+}
+
+// initAudit инициализирует глобальный логгер аудита
+func initAudit(pkiDir string, logger *log.Logger) error {
+	auditMutex.Lock()
+	defer auditMutex.Unlock()
+
+	if auditInitialized && globalAuditLogger != nil {
+		return nil
+	}
+
+	auditDir := filepath.Join(pkiDir, "audit")
+	auditLogPath := filepath.Join(auditDir, "audit.log")
+	chainPath := filepath.Join(auditDir, "chain.dat")
+
+	if err := os.MkdirAll(auditDir, 0755); err != nil {
+		return fmt.Errorf("не удалось создать директорию аудита: %w", err)
+	}
+
+	fileExists := false
+	if _, err := os.Stat(auditLogPath); err == nil {
+		fileExists = true
+	}
+
+	var err error
+	globalAuditLogger, err = audit.NewAuditLogger(auditLogPath, chainPath, logger)
+	if err != nil {
+		return fmt.Errorf("не удалось инициализировать аудит: %w", err)
+	}
+
+	if !fileExists {
+		if err := globalAuditLogger.Log(audit.LevelInfo, "system_start", "success",
+			"MicroPKI started", map[string]interface{}{}); err != nil {
+			logger.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось создать начальную запись аудита: %v", err)
+		}
+		logger.Printf("INFO: Создан новый журнал аудита")
+	} else {
+		logger.Printf("INFO: Используется существующий журнал аудита")
+	}
+
+	auditInitialized = true
+	return nil
+}
+
+// Функция для получения глобального логгера
+func GetAuditLogger() *audit.AuditLogger {
+	auditMutex.Lock()
+	defer auditMutex.Unlock()
+	return globalAuditLogger
+}
+
+func runTestRSA1024(args []string, logger *log.Logger) error {
+	fmt.Println("=== Тест RSA-1024 (должна быть ошибка) ===")
+
+	caCertPath := "./pki/certs/intermediate.cert.pem"
+	caKeyPath := "./pki/private/intermediate.key.pem"
+	passFile := "./pki/int-pass.txt"
+
+	if _, err := os.Stat(caCertPath); err != nil {
+		return fmt.Errorf("CA сертификат не найден. Сначала создайте PKI: %w", err)
+	}
+	if _, err := os.Stat(caKeyPath); err != nil {
+		return fmt.Errorf("CA ключ не найден. Сначала создайте PKI: %w", err)
+	}
+	if _, err := os.Stat(passFile); err != nil {
+		return fmt.Errorf("Файл пароля не найден: %s", passFile)
+	}
+
+	fmt.Println("Попытка генерации RSA-1024 ключа...")
+	_, err := internalcrypto.GenerateKeyPair("rsa", 1024)
+	if err != nil {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "1024") ||
+			strings.Contains(errMsg, "минимальный") ||
+			strings.Contains(errMsg, "2048") {
+			fmt.Printf("\nТест ПРОЙДЕН: RSA-1024 заблокирован при генерации\n")
+			fmt.Printf("   Ошибка: %v\n", err)
+			return nil
+		}
+		return fmt.Errorf("неожиданная ошибка: %w", err)
+	}
+
+	fmt.Println("⚠ Генерация прошла успешно, проверяем выпуск...")
+
+	keyPair, _ := internalcrypto.GenerateKeyPair("rsa", 1024)
+	subject, _ := certs.ParseDN("CN=rsa-1024-test.local")
+	csrCfg := &csr.CSRConfig{
+		Subject: subject,
+		Key:     keyPair.PrivateKey,
+	}
+	csrPEM, _ := csr.GenerateIntermediateCSR(csrCfg)
+
+	passphrase, _ := readPassphraseFromFile(passFile)
+	defer internalcrypto.SecureZero(passphrase)
+
+	_, err = ca.IssueCertificateFromCSR(
+		caCertPath, caKeyPath, passphrase,
+		csrPEM, templates.Server, 365,
+		"/tmp", "", logger,
+	)
+
+	if err != nil {
+		if strings.Contains(err.Error(), "минимальный") ||
+			strings.Contains(err.Error(), "2048") {
+			fmt.Printf("\nТест ПРОЙДЕН: RSA-1024 заблокирован при выпуске\n")
+			fmt.Printf("   Ошибка: %v\n", err)
+			return nil
+		}
+		return fmt.Errorf("неожиданная ошибка: %w", err)
+	}
+
+	fmt.Printf("\nТест НЕ ПРОЙДЕН: RSA-1024 не был заблокирован\n")
+	return fmt.Errorf("тест провален: RSA-1024 не заблокирован")
+}
+
+func runAuditDetectAnomalies(args []string, logger *log.Logger) error {
+	cmd := flag.NewFlagSet("audit-detect-anomalies", flag.ContinueOnError)
+
+	var (
+		logPath    string
+		timeWindow int
+	)
+
+	cmd.StringVar(&logPath, "log-file", "./pki/audit/audit.log", "Путь к журналу аудита")
+	cmd.IntVar(&timeWindow, "window", 24, "Временное окно анализа в часах")
+
+	if err := cmd.Parse(args); err != nil {
+		return err
+	}
+
+	if _, err := os.Stat(logPath); err != nil {
+		return fmt.Errorf("журнал аудита не найден: %w", err)
+	}
+
+	result, err := audit.DetectAnomalies(logPath, timeWindow)
+	if err != nil {
+		return fmt.Errorf("ошибка анализа аномалий: %w", err)
+	}
+
+	fmt.Println("=== Анализ аномалий в журнале аудита ===")
+	fmt.Printf("Временное окно анализа: %d часов\n", timeWindow)
+	fmt.Printf("Фактический период записей: %s\n", result.TimeSpan.Round(time.Second))
+	fmt.Printf("Всего запросов: %d\n", result.TotalRequests)
+	fmt.Printf("Пиковая нагрузка: %d запросов/мин\n", result.PeakRate)
+
+	if result.TimeSpan.Hours() < 1 {
+		fmt.Printf("Средняя нагрузка: %.2f запросов/час (за %.0f секунд)\n",
+			result.AvgRate, result.TimeSpan.Seconds())
+	} else {
+		fmt.Printf("Средняя нагрузка: %.2f запросов/час\n", result.AvgRate)
+	}
+
+	if result.Detected {
+		fmt.Println("\n⚠ ОБНАРУЖЕНЫ АНОМАЛИИ:")
+		for _, anomaly := range result.Anomalies {
+			fmt.Printf("  - %s\n", anomaly)
+		}
+	} else {
+		fmt.Println("\nАномалий не обнаружено")
 	}
 
 	return nil

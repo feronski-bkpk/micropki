@@ -17,26 +17,30 @@ import (
 
 	"micropki/micropki/internal/ca"
 	"micropki/micropki/internal/database"
+	"micropki/micropki/internal/ratelimit"
 	"micropki/micropki/internal/templates"
 )
 
 // Server представляет HTTP сервер репозитория сертификатов.
 type Server struct {
-	db       *database.DB
-	certDir  string
-	logger   *log.Logger
-	httpServ *http.Server
-	pkiDir   string
+	db          *database.DB
+	certDir     string
+	logger      *log.Logger
+	httpServ    *http.Server
+	pkiDir      string
+	rateLimiter *ratelimit.Limiter
 }
 
 // Config содержит конфигурацию для сервера репозитория.
 type Config struct {
-	Host     string
-	Port     int
-	DBPath   string
-	CertDir  string
-	LogFile  string
-	LogLevel string
+	Host      string
+	Port      int
+	DBPath    string
+	CertDir   string
+	LogFile   string
+	LogLevel  string
+	RateLimit float64
+	RateBurst int
 }
 
 // NewServer создает новый экземпляр сервера репозитория.
@@ -67,6 +71,12 @@ func NewServer(cfg *Config) (*Server, error) {
 		pkiDir = filepath.Dir(cfg.CertDir)
 	}
 
+	var limiter *ratelimit.Limiter
+	if cfg.RateLimit > 0 {
+		limiter = ratelimit.NewLimiter(cfg.RateLimit, cfg.RateBurst)
+		logger.Printf("Rate limiting enabled: %.2f req/s, burst: %d", cfg.RateLimit, cfg.RateBurst)
+	}
+
 	logger.Printf("Server initialized with:")
 	logger.Printf("  DB Path: %s", cfg.DBPath)
 	logger.Printf("  Cert Dir: %s", cfg.CertDir)
@@ -74,10 +84,11 @@ func NewServer(cfg *Config) (*Server, error) {
 	logger.Printf("  Log File: %s", cfg.LogFile)
 
 	return &Server{
-		db:      db,
-		certDir: cfg.CertDir,
-		logger:  logger,
-		pkiDir:  pkiDir,
+		db:          db,
+		certDir:     cfg.CertDir,
+		logger:      logger,
+		pkiDir:      pkiDir,
+		rateLimiter: limiter,
 	}, nil
 }
 
@@ -128,10 +139,37 @@ func (s *Server) Stop() error {
 	return nil
 }
 
-// loggingMiddleware логирует все входящие HTTP запросы.
+// getClientIP извлекает IP клиента из запроса
+func getClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		ips := strings.Split(xff, ",")
+		return strings.TrimSpace(ips[0])
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	ip := r.RemoteAddr
+	if colon := strings.LastIndex(ip, ":"); colon != -1 {
+		ip = ip[:colon]
+	}
+	return ip
+}
+
+// loggingMiddleware логирует все входящие HTTP запросы и применяет rate limiting.
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		clientIP := getClientIP(r)
+
+		if s.rateLimiter != nil {
+			if !s.rateLimiter.Allow(clientIP) {
+				w.Header().Set("Retry-After", "10")
+				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+				s.logger.Printf("Rate limit exceeded for %s on %s %s",
+					clientIP, r.Method, r.URL.Path)
+				return
+			}
+		}
 
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 
@@ -142,7 +180,7 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 			r.Method,
 			r.URL.Path,
 			rw.statusCode,
-			r.RemoteAddr,
+			clientIP,
 			r.UserAgent(),
 			duration,
 		)
@@ -152,7 +190,7 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 // handleRequestCert обрабатывает POST /request-cert
 func (s *Server) handleRequestCert(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	clientIP := r.RemoteAddr
+	clientIP := getClientIP(r)
 
 	s.logger.Printf("API REQUEST: POST /request-cert from %s, template=%s",
 		clientIP, r.URL.Query().Get("template"))
@@ -213,8 +251,8 @@ func (s *Server) handleRequestCert(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Printf("API INFO: Processing CSR request for template: %s from %s", template, clientIP)
 
-	caCertPath := filepath.Join(s.pkiDir, "intermediate", "certs", "intermediate.cert.pem")
-	caKeyPath := filepath.Join(s.pkiDir, "intermediate", "private", "intermediate.key.pem")
+	caCertPath := filepath.Join(s.pkiDir, "certs", "intermediate.cert.pem")
+	caKeyPath := filepath.Join(s.pkiDir, "private", "intermediate.key.pem")
 	passFile := filepath.Join(s.pkiDir, "int-pass.txt")
 
 	if _, err := os.Stat(caCertPath); err != nil {

@@ -92,6 +92,14 @@ func setupPKI(t *testing.T, baseDir string) error {
 
 	os.MkdirAll(baseDir, 0755)
 
+	certsDir := filepath.Join(baseDir, "certs")
+	privateDir := filepath.Join(baseDir, "private")
+	crlDir := filepath.Join(baseDir, "crl")
+
+	for _, dir := range []string{certsDir, privateDir, crlDir} {
+		os.MkdirAll(dir, 0755)
+	}
+
 	t.Logf("Initializing database at %s/micropki.db", baseDir)
 	output, err := runCLI(t, "db", "init", "--db-path", baseDir+"/micropki.db", "--force")
 	if err != nil {
@@ -112,13 +120,16 @@ func setupPKI(t *testing.T, baseDir string) error {
 		"--key-type", "rsa",
 		"--key-size", "4096",
 		"--passphrase-file", rootPass,
-		"--out-dir", baseDir+"/root",
+		"--out-dir", baseDir,
 		"--validity-days", "365",
 		"--force",
 	)
 	if err != nil {
 		return fmt.Errorf("root init: %w", err)
 	}
+
+	os.Rename(filepath.Join(baseDir, "certs", "ca.cert.pem"), filepath.Join(certsDir, "ca.cert.pem"))
+	os.Rename(filepath.Join(baseDir, "private", "ca.key.pem"), filepath.Join(privateDir, "ca.key.pem"))
 
 	intPass := baseDir + "/int-pass.txt"
 	if err := os.WriteFile(intPass, []byte("intpass123"), 0600); err != nil {
@@ -127,19 +138,22 @@ func setupPKI(t *testing.T, baseDir string) error {
 
 	t.Log("Creating intermediate CA...")
 	_, err = runCLI(t, "ca", "issue-intermediate",
-		"--root-cert", baseDir+"/root/certs/ca.cert.pem",
-		"--root-key", baseDir+"/root/private/ca.key.pem",
+		"--root-cert", filepath.Join(certsDir, "ca.cert.pem"),
+		"--root-key", filepath.Join(privateDir, "ca.key.pem"),
 		"--root-pass-file", rootPass,
 		"--subject", "/CN=Test Intermediate CA",
 		"--key-type", "rsa",
 		"--key-size", "4096",
 		"--passphrase-file", intPass,
-		"--out-dir", baseDir+"/intermediate",
+		"--out-dir", baseDir,
 		"--db-path", baseDir+"/micropki.db",
 	)
 	if err != nil {
 		return fmt.Errorf("intermediate issue: %w", err)
 	}
+
+	os.Rename(filepath.Join(baseDir, "certs", "intermediate.cert.pem"), filepath.Join(certsDir, "intermediate.cert.pem"))
+	os.Rename(filepath.Join(baseDir, "private", "intermediate.key.pem"), filepath.Join(privateDir, "intermediate.key.pem"))
 
 	checkDBTables(t, baseDir+"/micropki.db")
 
@@ -152,19 +166,19 @@ func issueTestCertificate(t *testing.T, baseDir, name string) string {
 
 	intPass := baseDir + "/int-pass.txt"
 	dbPath := baseDir + "/micropki.db"
-	certDir := baseDir + "/certs"
+	certsDir := filepath.Join(baseDir, "certs")
+	privateDir := filepath.Join(baseDir, "private")
 
-	os.RemoveAll(certDir)
-	os.MkdirAll(certDir, 0755)
+	os.MkdirAll(certsDir, 0755)
 
 	output, err := runCLI(t, "ca", "issue-cert",
-		"--ca-cert", baseDir+"/intermediate/certs/intermediate.cert.pem",
-		"--ca-key", baseDir+"/intermediate/private/intermediate.key.pem",
+		"--ca-cert", filepath.Join(certsDir, "intermediate.cert.pem"),
+		"--ca-key", filepath.Join(privateDir, "intermediate.key.pem"),
 		"--ca-pass-file", intPass,
 		"--template", "server",
 		"--subject", "CN="+name,
 		"--san", "dns:"+name,
-		"--out-dir", certDir,
+		"--out-dir", certsDir,
 		"--db-path", dbPath,
 	)
 	if err != nil {
@@ -173,7 +187,6 @@ func issueTestCertificate(t *testing.T, baseDir, name string) string {
 
 	t.Logf("CLI output: %s", output)
 
-	// Извлекаем серийный номер из вывода
 	lines := strings.Split(output, "\n")
 	var serial string
 	for _, line := range lines {
@@ -190,71 +203,21 @@ func issueTestCertificate(t *testing.T, baseDir, name string) string {
 		t.Fatal("Could not extract serial number from output")
 	}
 
-	// Проверяем наличие файлов сертификатов
-	files, err := filepath.Glob(certDir + "/*.cert.pem")
-	if err != nil || len(files) == 0 {
-		t.Logf("WARNING: No certificate files found in %s", certDir)
-	} else {
-		t.Logf("Certificate files: %v", files)
-	}
-
-	// Даём время на запись в БД
-	time.Sleep(1 * time.Second)
-
-	// Проверяем, что сертификат добавлен в БД
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		t.Logf("Could not open DB for verification: %v", err)
-		return serial
-	}
-	defer db.Close()
-
-	// Для диагностики показываем таблицы в БД
-	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='table'")
-	if err == nil {
-		defer rows.Close()
-		tables := []string{}
-		for rows.Next() {
-			var name string
-			rows.Scan(&name)
-			tables = append(tables, name)
-		}
-		t.Logf("Tables in DB: %v", tables)
-	}
-
-	// Проверяем наличие сертификата в БД
-	var count int
-	normalizedSerial := strings.ToLower(serial)
-	err = db.QueryRow("SELECT COUNT(*) FROM certificates WHERE LOWER(serial_hex) = ?", normalizedSerial).Scan(&count)
-	if err != nil {
-		t.Logf("WARNING: Could not verify certificate in DB: %v", err)
-	} else if count == 0 {
-		// Сертификат не найден - показываем все сертификаты для диагностики
-		t.Logf("WARNING: Certificate %s not immediately found in DB, checking all certificates...", serial)
-
-		rows, err := db.Query("SELECT serial_hex, subject FROM certificates")
+	for i := 0; i < 5; i++ {
+		db, err := sql.Open("sqlite3", dbPath)
 		if err == nil {
-			defer rows.Close()
-			found := false
-			t.Log("Certificates in DB:")
-			for rows.Next() {
-				var s, subj string
-				rows.Scan(&s, &subj)
-				t.Logf("  %s: %s", s, subj)
-				if strings.EqualFold(s, serial) {
-					found = true
-				}
-			}
-			if found {
-				t.Logf("✓ Certificate %s found in DB (case-insensitive match)", serial)
-			} else {
-				t.Logf("WARNING: Certificate %s NOT found in DB after issuance!", serial)
+			var count int
+			err = db.QueryRow("SELECT COUNT(*) FROM certificates WHERE LOWER(serial_hex) = ?", strings.ToLower(serial)).Scan(&count)
+			db.Close()
+			if err == nil && count > 0 {
+				t.Logf("✓ Certificate %s verified in DB", serial)
+				return serial
 			}
 		}
-	} else {
-		t.Logf("✓ Certificate %s verified in DB", serial)
+		time.Sleep(200 * time.Millisecond)
 	}
 
+	t.Logf("WARNING: Certificate %s not found in DB after 1 second", serial)
 	return serial
 }
 
@@ -383,6 +346,9 @@ func TestCRLGeneration(t *testing.T) {
 		t.Fatalf("Failed to setup PKI: %v", err)
 	}
 
+	crlDir := filepath.Join(testDir, "crl")
+	os.MkdirAll(crlDir, 0755)
+
 	_, err = runCLI(t, "ca", "gen-crl",
 		"--ca", "intermediate",
 		"--next-update", "7",
@@ -393,9 +359,9 @@ func TestCRLGeneration(t *testing.T) {
 		t.Fatalf("Failed to generate CRL: %v", err)
 	}
 
-	crlPath := testDir + "/crl/intermediate.crl.pem"
+	crlPath := filepath.Join(crlDir, "intermediate.crl.pem")
 	if _, err := os.Stat(crlPath); err != nil {
-		t.Fatalf("CRL file not created: %v", err)
+		t.Fatalf("CRL file not created at %s: %v", crlPath, err)
 	}
 
 	info, err := os.Stat(crlPath)
@@ -675,6 +641,9 @@ func TestCRLNumberIncrement(t *testing.T) {
 		t.Fatalf("Failed to setup PKI: %v", err)
 	}
 
+	crlDir := filepath.Join(testDir, "crl")
+	os.MkdirAll(crlDir, 0755)
+
 	_, err = runCLI(t, "ca", "gen-crl",
 		"--ca", "intermediate",
 		"--next-update", "7",
@@ -685,7 +654,7 @@ func TestCRLNumberIncrement(t *testing.T) {
 		t.Fatalf("Failed to generate first CRL: %v", err)
 	}
 
-	number1 := getCRLNumber(t, testDir+"/crl/intermediate.crl.pem")
+	number1 := getCRLNumber(t, filepath.Join(crlDir, "intermediate.crl.pem"))
 	t.Logf("First CRL number: %s", number1)
 
 	_, err = runCLI(t, "ca", "gen-crl",
@@ -698,18 +667,13 @@ func TestCRLNumberIncrement(t *testing.T) {
 		t.Fatalf("Failed to generate second CRL: %v", err)
 	}
 
-	number2 := getCRLNumber(t, testDir+"/crl/intermediate.crl.pem")
+	number2 := getCRLNumber(t, filepath.Join(crlDir, "intermediate.crl.pem"))
 	t.Logf("Second CRL number: %s", number2)
 
 	if number1 == "" || number2 == "" {
 		t.Skip("Could not extract CRL numbers, skipping increment check")
 	}
 	if number1 == number2 {
-		cmd := exec.Command("openssl", "crl", "-in", testDir+"/crl/intermediate.crl.pem",
-			"-inform", "PEM", "-text", "-noout")
-		output, _ := cmd.CombinedOutput()
-		t.Logf("CRL content:\n%s", string(output))
-
 		t.Errorf("CRL number did not increment: %s -> %s", number1, number2)
 	}
 }
@@ -730,6 +694,11 @@ func TestHTTPCRLEndpoints(t *testing.T) {
 	}
 
 	dbPath := testDir + "/micropki.db"
+	certsDir := filepath.Join(testDir, "certs")
+	crlDir := filepath.Join(testDir, "crl")
+	repoLogPath := filepath.Join(testDir, "repo.log")
+
+	os.MkdirAll(crlDir, 0755)
 
 	serial := issueTestCertificate(t, testDir, "test.example.com")
 	t.Logf("Issued certificate with serial: %s", serial)
@@ -761,33 +730,22 @@ func TestHTTPCRLEndpoints(t *testing.T) {
 		t.Fatalf("Failed to generate root CRL: %v", err)
 	}
 
-	intermediateCRL := testDir + "/crl/intermediate.crl.pem"
-	rootCRL := testDir + "/crl/root.crl.pem"
+	intermediateCRL := filepath.Join(crlDir, "intermediate.crl.pem")
+	rootCRL := filepath.Join(crlDir, "root.crl.pem")
 
-	t.Logf("Checking CRL files:")
 	if _, err := os.Stat(intermediateCRL); err != nil {
 		t.Fatalf("Intermediate CRL file not created: %v", err)
-	} else {
-		info, _ := os.Stat(intermediateCRL)
-		t.Logf("  intermediate.crl.pem exists, size: %d bytes", info.Size())
 	}
-
 	if _, err := os.Stat(rootCRL); err != nil {
 		t.Fatalf("Root CRL file not created: %v", err)
-	} else {
-		info, _ := os.Stat(rootCRL)
-		t.Logf("  root.crl.pem exists, size: %d bytes", info.Size())
 	}
-
-	repoLog := testDir + "/repo.log"
-	t.Logf("Repository log file: %s", repoLog)
 
 	cmd := exec.Command("../micropki-cli", "repo", "serve",
 		"--host", "127.0.0.1",
 		"--port", "18080",
 		"--db-path", dbPath,
-		"--cert-dir", testDir+"/certs",
-		"--log-file", repoLog,
+		"--cert-dir", certsDir,
+		"--log-file", repoLogPath,
 	)
 
 	err = cmd.Start()
@@ -801,7 +759,7 @@ func TestHTTPCRLEndpoints(t *testing.T) {
 
 	time.Sleep(3 * time.Second)
 
-	if logContent, err := os.ReadFile(repoLog); err == nil {
+	if logContent, err := os.ReadFile(repoLogPath); err == nil {
 		t.Logf("Repository log content:\n%s", string(logContent))
 	} else {
 		t.Logf("Could not read repo log: %v", err)

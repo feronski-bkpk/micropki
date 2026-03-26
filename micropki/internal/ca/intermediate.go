@@ -13,10 +13,15 @@ import (
 	"strings"
 	"time"
 
+	"micropki/micropki/internal/audit"
 	"micropki/micropki/internal/certs"
+	"micropki/micropki/internal/compromise"
 	cryptolib "micropki/micropki/internal/crypto"
 	"micropki/micropki/internal/csr"
+	"micropki/micropki/internal/database"
+	"micropki/micropki/internal/policy"
 	"micropki/micropki/internal/templates"
+	"micropki/micropki/internal/transparency"
 )
 
 // CAConfig содержит параметры конфигурации для создания промежуточного CA.
@@ -30,6 +35,8 @@ type CAConfig struct {
 	RootPassphrase []byte
 	// Subject - различающееся имя (DN) для нового промежуточного CA
 	Subject *pkix.Name
+	// SANs - альтернативные имена субъекта для CA
+	SANs []templates.SAN
 	// KeyType - тип ключа: "rsa" или "ecc"
 	KeyType string
 	// KeySize - размер ключа: 4096 для RSA, 384 для ECC
@@ -40,25 +47,58 @@ type CAConfig struct {
 	OutDir string
 	// ValidityDays - срок действия сертификата в днях
 	ValidityDays int
-	// PathLen - ограничение длины пути (максимальное количество промежуточных CA ниже)
+	// PathLen - ограничение длины пути
 	PathLen int
+	// AuditLogger - логгер аудита
+	AuditLogger *audit.AuditLogger
 }
 
 // IssueIntermediate создаёт новый промежуточный CA, подписанный корневым CA.
-// Функция выполняет следующие шаги:
-//  1. Загрузка сертификата и ключа корневого CA
-//  2. Генерация ключевой пары для промежуточного CA
-//  3. Генерация серийного номера
-//  4. Создание шаблона сертификата промежуточного CA
-//  5. Подписание сертификата корневым CA
-//  6. Проверка созданного сертификата
-//  7. Сохранение зашифрованного закрытого ключа
-//  8. Сохранение сертификата
-//  9. Обновление документа политики
-//
 // Возвращает ошибку, если какой-либо из шагов завершился неудачей.
 func IssueIntermediate(cfg *CAConfig) error {
-	// 1. Загрузка сертификата и ключа корневого CA
+	policyConfig := policy.DefaultPolicyConfig()
+
+	if cfg.AuditLogger != nil {
+		cfg.AuditLogger.Log(audit.LevelAudit, "issue_intermediate_ca", "started",
+			"Начало создания промежуточного CA",
+			map[string]interface{}{
+				"subject":       cfg.Subject.String(),
+				"key_type":      cfg.KeyType,
+				"key_size":      cfg.KeySize,
+				"validity_days": cfg.ValidityDays,
+				"path_len":      cfg.PathLen,
+			})
+	}
+
+	if err := policyConfig.ValidateValidity(cfg.ValidityDays, true, false); err != nil {
+		if cfg.AuditLogger != nil {
+			cfg.AuditLogger.Log(audit.LevelError, "issue_intermediate_ca", "failure",
+				fmt.Sprintf("Нарушение политики: %v", err),
+				map[string]interface{}{"validity_days": cfg.ValidityDays})
+		}
+		return fmt.Errorf("нарушение политики: %w", err)
+	}
+
+	if err := policyConfig.ValidatePathLength(cfg.PathLen, true); err != nil {
+		if cfg.AuditLogger != nil {
+			cfg.AuditLogger.Log(audit.LevelError, "issue_intermediate_ca", "failure",
+				fmt.Sprintf("Нарушение политики: %v", err),
+				map[string]interface{}{"path_len": cfg.PathLen})
+		}
+		return fmt.Errorf("нарушение политики: %w", err)
+	}
+
+	if len(cfg.SANs) > 0 {
+		if err := policyConfig.ValidateWildcardForCA(cfg.SANs, true); err != nil {
+			if cfg.AuditLogger != nil {
+				cfg.AuditLogger.Log(audit.LevelError, "issue_intermediate_ca", "failure",
+					fmt.Sprintf("Нарушение политики: %v", err),
+					map[string]interface{}{"sans": cfg.SANs})
+			}
+			return fmt.Errorf("нарушение политики: %w", err)
+		}
+	}
+
 	rootCert, err := certs.LoadCertificate(cfg.RootCertPath)
 	if err != nil {
 		return fmt.Errorf("не удалось загрузить сертификат корневого CA: %w", err)
@@ -69,25 +109,31 @@ func IssueIntermediate(cfg *CAConfig) error {
 		return fmt.Errorf("не удалось загрузить закрытый ключ корневого CA: %w", err)
 	}
 
-	// 2. Генерация ключевой пары промежуточного CA
 	keyPair, err := cryptolib.GenerateKeyPair(cfg.KeyType, cfg.KeySize)
 	if err != nil {
 		return fmt.Errorf("не удалось сгенерировать ключевую пару промежуточного CA: %w", err)
 	}
 
-	// 3. Генерация серийного номера
+	if err := policyConfig.ValidateKeySize(keyPair.PublicKey, true, templates.Server); err != nil {
+		if cfg.AuditLogger != nil {
+			cfg.AuditLogger.Log(audit.LevelError, "issue_intermediate_ca", "failure",
+				fmt.Sprintf("Нарушение политики размера ключа: %v", err),
+				map[string]interface{}{"key_type": cfg.KeyType, "key_size": cfg.KeySize})
+		}
+		return fmt.Errorf("нарушение политики: %w", err)
+	}
+
 	serialNumber, err := templates.NewSerialNumber()
 	if err != nil {
 		return fmt.Errorf("не удалось сгенерировать серийный номер: %w", err)
 	}
 
-	// 4. Установка периода действия
 	notBefore := time.Now().UTC()
 	notAfter := notBefore.AddDate(0, 0, cfg.ValidityDays)
 
-	// 5. Создание шаблона промежуточного CA
 	tmplCfg := &templates.TemplateConfig{
 		Subject:      cfg.Subject,
+		SANs:         cfg.SANs,
 		SerialNumber: serialNumber,
 		NotBefore:    notBefore,
 		NotAfter:     notAfter,
@@ -98,30 +144,35 @@ func IssueIntermediate(cfg *CAConfig) error {
 
 	template := templates.NewIntermediateCATemplate(tmplCfg)
 
-	// 6. Создание сертификата (корневой CA подписывает промежуточный)
 	certDER, err := x509.CreateCertificate(
 		rand.Reader,
-		template,          // шаблон нового сертификата
-		rootCert,          // сертификат издателя (корневой CA)
-		keyPair.PublicKey, // открытый ключ нового сертификата
-		rootKey,           // закрытый ключ издателя
+		template,
+		rootCert,
+		keyPair.PublicKey,
+		rootKey,
 	)
 	if err != nil {
 		return fmt.Errorf("не удалось создать сертификат промежуточного CA: %w", err)
 	}
 
-	// 7. Парсинг созданного сертификата для проверки
 	intermediateCert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return fmt.Errorf("не удалось разобрать созданный сертификат: %w", err)
 	}
 
-	// 8. Проверка подписи сертификата
+	if err := policyConfig.ValidateSignatureAlgorithm(intermediateCert.SignatureAlgorithm); err != nil {
+		if cfg.AuditLogger != nil {
+			cfg.AuditLogger.Log(audit.LevelError, "issue_intermediate_ca", "failure",
+				fmt.Sprintf("Нарушение политики: %v", err),
+				map[string]interface{}{"signature_algo": intermediateCert.SignatureAlgorithm.String()})
+		}
+		return fmt.Errorf("нарушение политики: %w", err)
+	}
+
 	if err := intermediateCert.CheckSignatureFrom(rootCert); err != nil {
 		return fmt.Errorf("проверка подписи созданного сертификата не пройдена: %w", err)
 	}
 
-	// 9. Сохранение зашифрованного закрытого ключа
 	privateKeyPath := filepath.Join(cfg.OutDir, "private", "intermediate.key.pem")
 	if err := cryptolib.SaveEncryptedPrivateKey(keyPair.PrivateKey, privateKeyPath, cfg.Passphrase); err != nil {
 		return fmt.Errorf("не удалось сохранить закрытый ключ промежуточного CA: %w", err)
@@ -130,15 +181,25 @@ func IssueIntermediate(cfg *CAConfig) error {
 		return fmt.Errorf("не удалось установить права доступа к ключу: %w", err)
 	}
 
-	// 10. Сохранение сертификата
 	certPath := filepath.Join(cfg.OutDir, "certs", "intermediate.cert.pem")
 	if err := certs.SaveCertificate(certDER, certPath); err != nil {
 		return fmt.Errorf("не удалось сохранить сертификат промежуточного CA: %w", err)
 	}
 
-	// 11. Обновление документа политики
 	if err := updatePolicyWithIntermediate(cfg.OutDir, intermediateCert, cfg); err != nil {
 		return fmt.Errorf("не удалось обновить документ политики: %w", err)
+	}
+
+	if cfg.AuditLogger != nil {
+		cfg.AuditLogger.Log(audit.LevelAudit, "issue_intermediate_ca", "success",
+			"Промежуточный CA успешно создан",
+			map[string]interface{}{
+				"serial":        fmt.Sprintf("%X", intermediateCert.SerialNumber),
+				"subject":       intermediateCert.Subject.String(),
+				"cert_path":     certPath,
+				"key_path":      privateKeyPath,
+				"validity_days": cfg.ValidityDays,
+			})
 	}
 
 	fmt.Printf("\nПромежуточный CA успешно создан!\n")
@@ -174,14 +235,30 @@ type IssueCertificateConfig struct {
 	KeyType string
 	// KeySize - размер ключа для внутренней генерации
 	KeySize int
+	// AuditLogger - логгер аудита
+	AuditLogger *audit.AuditLogger
+	// DBPath - путь к базе данных для вставки сертификата
+	DBPath string
 }
 
 // IssueCertificate выпускает конечный сертификат, подписанный промежуточным CA.
-// Функция поддерживает два режима работы:
-//  1. Генерация новой ключевой пары и создание сертификата
-//  2. Подписание внешнего CSR (без генерации ключа)
 func IssueCertificate(cfg *IssueCertificateConfig) error {
-	// 1. Загрузка сертификата и ключа CA
+	if audit.IsIntegrityBroken() {
+		return fmt.Errorf("ОПЕРАЦИЯ ЗАБЛОКИРОВАНА: нарушена целостность журнала аудита. Восстановите целостность перед продолжением работы")
+	}
+
+	policyConfig := policy.DefaultPolicyConfig()
+
+	if cfg.AuditLogger != nil {
+		cfg.AuditLogger.Log(audit.LevelAudit, "issue_certificate", "started",
+			"Начало выпуска сертификата",
+			map[string]interface{}{
+				"template":      cfg.Template,
+				"validity_days": cfg.ValidityDays,
+				"csr_path":      cfg.CSRPath,
+			})
+	}
+
 	caCert, err := certs.LoadCertificate(cfg.CACertPath)
 	if err != nil {
 		return fmt.Errorf("не удалось загрузить сертификат CA: %w", err)
@@ -197,13 +274,35 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 	var certSubject *pkix.Name
 	var certSANs []templates.SAN
 
-	// 2. Обработка CSR или генерация новой ключевой пары
 	if cfg.CSRPath != "" {
 		certSubject, certSANs, publicKey, err = processExternalCSR(cfg)
 		if err != nil {
+			if cfg.AuditLogger != nil {
+				cfg.AuditLogger.Log(audit.LevelError, "issue_certificate", "failure",
+					fmt.Sprintf("Ошибка обработки CSR: %v", err),
+					map[string]interface{}{"csr_path": cfg.CSRPath})
+			}
 			return fmt.Errorf("не удалось обработать внешний CSR: %w", err)
 		}
+
+		if err := policyConfig.ValidateKeySize(publicKey, false, cfg.Template); err != nil {
+			if cfg.AuditLogger != nil {
+				cfg.AuditLogger.Log(audit.LevelError, "issue_certificate", "failure",
+					fmt.Sprintf("Нарушение политики размера ключа: %v", err),
+					map[string]interface{}{"key_type": "CSR"})
+			}
+			return fmt.Errorf("нарушение политики: %w", err)
+		}
 	} else {
+		if err := policyConfig.ValidateValidity(cfg.ValidityDays, false, false); err != nil {
+			if cfg.AuditLogger != nil {
+				cfg.AuditLogger.Log(audit.LevelError, "issue_certificate", "failure",
+					fmt.Sprintf("Нарушение политики срока действия: %v", err),
+					map[string]interface{}{"validity_days": cfg.ValidityDays})
+			}
+			return fmt.Errorf("нарушение политики: %w", err)
+		}
+
 		keyPair, err := cryptolib.GenerateKeyPair(cfg.KeyType, cfg.KeySize)
 		if err != nil {
 			return fmt.Errorf("не удалось сгенерировать ключевую пару: %w", err)
@@ -213,22 +312,55 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		certSubject = cfg.Subject
 		certSANs = cfg.SANs
 
+		if err := policyConfig.ValidateKeySize(publicKey, false, cfg.Template); err != nil {
+			if cfg.AuditLogger != nil {
+				cfg.AuditLogger.Log(audit.LevelError, "issue_certificate", "failure",
+					fmt.Sprintf("Нарушение политики размера ключа: %v", err),
+					map[string]interface{}{"key_type": cfg.KeyType, "key_size": cfg.KeySize})
+			}
+			return fmt.Errorf("нарушение политики: %w", err)
+		}
+
 		if err := templates.ValidateTemplateCompatibility(cfg.Template, certSANs); err != nil {
 			return fmt.Errorf("проверка шаблона не пройдена: %w", err)
 		}
 	}
 
-	// 3. Генерация серийного номера
+	if err := policyConfig.ValidateSANs(certSANs, cfg.Template); err != nil {
+		if cfg.AuditLogger != nil {
+			cfg.AuditLogger.Log(audit.LevelError, "issue_certificate", "failure",
+				fmt.Sprintf("Нарушение политики SAN: %v", err),
+				map[string]interface{}{"sans": certSANs})
+		}
+		return fmt.Errorf("нарушение политики: %w", err)
+	}
+
+	if cfg.DBPath != "" {
+		db, err := database.New(cfg.DBPath)
+		if err == nil {
+			compMgr := compromise.NewCompromiseManager(db, nil)
+
+			if compromised, err := compMgr.IsKeyCompromisedByPublicKey(publicKey); err == nil && compromised {
+				db.Close()
+				if cfg.AuditLogger != nil {
+					cfg.AuditLogger.Log(audit.LevelError, "issue_certificate", "failure",
+						"Попытка использовать скомпрометированный ключ",
+						map[string]interface{}{"key_type": "compromised"})
+				}
+				return fmt.Errorf("нарушение политики: ключ скомпрометирован, выпуск запрещен")
+			}
+			db.Close()
+		}
+	}
+
 	serialNumber, err := templates.NewSerialNumber()
 	if err != nil {
 		return fmt.Errorf("не удалось сгенерировать серийный номер: %w", err)
 	}
 
-	// 4. Установка периода действия
 	notBefore := time.Now().UTC()
 	notAfter := notBefore.AddDate(0, 0, cfg.ValidityDays)
 
-	// 5. Создание шаблона согласно типу
 	tmplCfg := &templates.TemplateConfig{
 		Subject:      certSubject,
 		SANs:         certSANs,
@@ -253,7 +385,6 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		return fmt.Errorf("не удалось создать шаблон: %w", err)
 	}
 
-	// 6. Создание сертификата
 	certDER, err := x509.CreateCertificate(
 		rand.Reader,
 		template,
@@ -265,22 +396,27 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		return fmt.Errorf("не удалось создать сертификат: %w", err)
 	}
 
-	// 7. Парсинг созданного сертификата для получения информации для имени файла
 	newCert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return fmt.Errorf("не удалось разобрать созданный сертификат: %w", err)
 	}
 
-	// 8. Определение имени файла на основе CN или первого DNS имени
+	if err := policyConfig.ValidateSignatureAlgorithm(newCert.SignatureAlgorithm); err != nil {
+		if cfg.AuditLogger != nil {
+			cfg.AuditLogger.Log(audit.LevelError, "issue_certificate", "failure",
+				fmt.Sprintf("Нарушение политики алгоритма подписи: %v", err),
+				map[string]interface{}{"signature_algo": newCert.SignatureAlgorithm.String()})
+		}
+		return fmt.Errorf("нарушение политики: %w", err)
+	}
+
 	filename := generateCertFilename(newCert, cfg.Template)
 
-	// 9. Сохранение сертификата
 	certPath := filepath.Join(cfg.OutDir, filename+".cert.pem")
 	if err := certs.SaveCertificate(certDER, certPath); err != nil {
 		return fmt.Errorf("не удалось сохранить сертификат: %w", err)
 	}
 
-	// 10. Сохранение закрытого ключа, если он был сгенерирован
 	var keyPath string
 	if privateKey != nil {
 		keyPath = filepath.Join(cfg.OutDir, filename+".key.pem")
@@ -293,7 +429,35 @@ func IssueCertificate(cfg *IssueCertificateConfig) error {
 		fmt.Printf("ПРЕДУПРЕЖДЕНИЕ: Закрытый ключ сохранён без шифрования в %s\n", keyPath)
 	}
 
-	// 11. Логирование выпуска
+	if cfg.DBPath != "" {
+		certPEM, err := os.ReadFile(certPath)
+		if err == nil {
+			if err := InsertCertificateIntoDB(cfg.DBPath, newCert, certPEM, nil); err != nil {
+				fmt.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось вставить сертификат в БД: %v\n", err)
+			}
+		}
+	}
+
+	ctLog, err := transparency.NewCTLog(filepath.Join(filepath.Dir(cfg.OutDir), "audit", "ct.log"))
+	if err == nil {
+		if err := ctLog.LogCertificate(newCert, caCert.Issuer.String()); err != nil {
+			fmt.Printf("ПРЕДУПРЕЖДЕНИЕ: Не удалось записать в CT-журнал: %v\n", err)
+		}
+	}
+
+	if cfg.AuditLogger != nil {
+		cfg.AuditLogger.Log(audit.LevelAudit, "issue_certificate", "success",
+			"Сертификат успешно выпущен",
+			map[string]interface{}{
+				"serial":        fmt.Sprintf("%X", newCert.SerialNumber),
+				"subject":       newCert.Subject.String(),
+				"template":      cfg.Template,
+				"cert_path":     certPath,
+				"validity_days": cfg.ValidityDays,
+				"sans":          certSANs,
+			})
+	}
+
 	fmt.Printf("\nСертификат успешно выпущен!\n")
 	fmt.Printf("Тип: %s\n", cfg.Template)
 	fmt.Printf("Сертификат: %s\n", certPath)
@@ -346,12 +510,6 @@ func processExternalCSR(cfg *IssueCertificateConfig) (*pkix.Name, []templates.SA
 }
 
 // generateCertFilename создаёт имя файла на основе содержимого сертификата.
-// Стратегия именования:
-//  1. Для серверных сертификатов - первое DNS имя
-//  2. Для клиентских сертификатов - первый email
-//  3. Иначе - Common Name
-//  4. В крайнем случае - серийный номер
-//
 // Возвращает безопасное для файловой системы имя.
 func generateCertFilename(cert *x509.Certificate, tmplType templates.TemplateType) string {
 	if tmplType == templates.Server && len(cert.DNSNames) > 0 {

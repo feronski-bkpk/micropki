@@ -134,6 +134,29 @@ func (db *DB) InitCRLSchema() error {
 	return nil
 }
 
+// InitCompromisedKeysTable создает таблицу compromised_keys
+func (db *DB) InitCompromisedKeysTable() error {
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS compromised_keys (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		public_key_hash TEXT UNIQUE NOT NULL,
+		certificate_serial TEXT NOT NULL,
+		compromise_date TEXT NOT NULL,
+		compromise_reason TEXT NOT NULL,
+		FOREIGN KEY (certificate_serial) REFERENCES certificates(serial_hex)
+	);
+	
+	CREATE INDEX IF NOT EXISTS idx_compromised_keys_hash ON compromised_keys(public_key_hash);
+	`
+
+	_, err := db.Exec(createTableSQL)
+	if err != nil {
+		return fmt.Errorf("не удалось создать таблицу compromised_keys: %w", err)
+	}
+
+	return nil
+}
+
 // InitSchemaWithCRL инициализирует схему базы данных, включая CRL таблицы.
 func (db *DB) InitSchemaWithCRL() error {
 	if err := db.InitSchema(); err != nil {
@@ -141,6 +164,10 @@ func (db *DB) InitSchemaWithCRL() error {
 	}
 
 	if err := db.InitCRLSchema(); err != nil {
+		return err
+	}
+
+	if err := db.InitCompromisedKeysTable(); err != nil {
 		return err
 	}
 

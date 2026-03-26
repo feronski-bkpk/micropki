@@ -2,13 +2,6 @@
 // Пакет предоставляет функциональность для создания и управления корневыми
 // и промежуточными центрами сертификации, а также для выпуска конечных
 // сертификатов.
-//
-// Основные возможности:
-//   - Инициализация корневого CA
-//   - Создание промежуточных CA, подписанных корневым
-//   - Выпуск сертификатов конечных сущностей (серверные, клиентские, подписи кода)
-//   - Подписание внешних CSR
-//
 // Все закрытые ключи хранятся в зашифрованном виде с использованием AES-256-GCM,
 // за исключением ключей конечных сертификатов, которые по умолчанию сохраняются
 // незашифрованными (с предупреждением).
@@ -24,6 +17,7 @@ import (
 	"micropki/micropki/internal/crypto"
 	"micropki/micropki/internal/csr"
 	"micropki/micropki/internal/database"
+	"micropki/micropki/internal/policy"
 	"micropki/micropki/internal/templates"
 	"os"
 	"path/filepath"
@@ -122,6 +116,20 @@ func IssueCertificateFromCSR(
 		return nil, fmt.Errorf("CSR несовместим с шаблоном: %w", err)
 	}
 
+	policyConfig := policy.DefaultPolicyConfig()
+
+	if err := policyConfig.ValidateKeySize(parsedCSR.PublicKey, false, templateType); err != nil {
+		return nil, fmt.Errorf("нарушение политики: %w", err)
+	}
+
+	if err := policyConfig.ValidateValidity(validityDays, false, false); err != nil {
+		return nil, fmt.Errorf("нарушение политики: %w", err)
+	}
+
+	if err := policyConfig.ValidateSANs(sans, templateType); err != nil {
+		return nil, fmt.Errorf("нарушение политики: %w", err)
+	}
+
 	serialNum, err := templates.NewSerialNumber()
 	if err != nil {
 		return nil, fmt.Errorf("не удалось сгенерировать серийный номер: %w", err)
@@ -168,6 +176,10 @@ func IssueCertificateFromCSR(
 	newCert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return nil, fmt.Errorf("не удалось разобрать созданный сертификат: %w", err)
+	}
+
+	if err := policyConfig.ValidateSignatureAlgorithm(newCert.SignatureAlgorithm); err != nil {
+		return nil, fmt.Errorf("нарушение политики: %w", err)
 	}
 
 	filename := generateCertFilename(newCert, templateType)
