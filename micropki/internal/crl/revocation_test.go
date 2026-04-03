@@ -198,3 +198,23 @@ func TestGetIssuerForCertificate(t *testing.T) {
 		t.Error("GetIssuerForCertificate for non-existent cert should return error")
 	}
 }
+
+// TestNormalizeSerialExtended тестирует нормализацию серийного номера
+func TestNormalizeSerialExtended(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"123ABC", "123abc"},
+		{"123abc", "123abc"},
+		{"ABCDEF", "abcdef"},
+		{"", "00"},
+	}
+
+	for _, tt := range tests {
+		result := normalizeSerial(tt.input)
+		if result != tt.expected {
+			t.Errorf("normalizeSerial(%q) = %q, want %q", tt.input, result, tt.expected)
+		}
+	}
+}

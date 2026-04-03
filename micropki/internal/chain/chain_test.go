@@ -1,12 +1,4 @@
 // Package chain_test содержит тесты для проверки цепочек сертификатов.
-// Тесты проверяют:
-//   - Создание валидных цепочек (корневой CA → промежуточный CA → конечный сертификат)
-//   - Успешную проверку корректных цепочек
-//   - Обнаружение ошибок в некорректных цепочках
-//   - Проверку подписей на всех уровнях
-//   - Проверку ограничений (CA флаги, сроки действия)
-//
-// Все тесты используют генерацию тестовых сертификатов для изоляции от внешних зависимостей.
 package chain
 
 import (
@@ -14,7 +6,10 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"math/big"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -33,13 +28,11 @@ import (
 //   - *rsa.PrivateKey: закрытый ключ сертификата
 //   - error: ошибку, если создание не удалось
 func generateTestCert(isCA bool, commonName string, signingKey *rsa.PrivateKey, signingCert *x509.Certificate) (*x509.Certificate, *rsa.PrivateKey, error) {
-	// Генерация ключевой пары
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Создание шаблона
 	serialNumber := big.NewInt(1)
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
@@ -65,12 +58,10 @@ func generateTestCert(isCA bool, commonName string, signingKey *rsa.PrivateKey, 
 		issuerCert = signingCert
 		issuerKey = signingKey
 	} else {
-		// Самоподписанный сертификат
 		issuerCert = template
 		issuerKey = key
 	}
 
-	// Создание сертификата
 	certDER, err := x509.CreateCertificate(rand.Reader, template, issuerCert, &key.PublicKey, issuerKey)
 	if err != nil {
 		return nil, nil, err
@@ -88,32 +79,27 @@ func generateTestCert(isCA bool, commonName string, signingKey *rsa.PrivateKey, 
 //
 // Ожидает, что проверка цепочки завершится без ошибок.
 func TestChainVerification(t *testing.T) {
-	// Генерация корневого CA
 	rootCert, rootKey, err := generateTestCert(true, "Test Root CA", nil, nil)
 	if err != nil {
 		t.Fatalf("Не удалось сгенерировать корневой CA: %v", err)
 	}
 
-	// Генерация промежуточного CA, подписанного корневым
 	intermediateCert, intermediateKey, err := generateTestCert(true, "Test Intermediate CA", rootKey, rootCert)
 	if err != nil {
 		t.Fatalf("Не удалось сгенерировать промежуточный CA: %v", err)
 	}
 
-	// Генерация конечного сертификата, подписанного промежуточным
 	leafCert, _, err := generateTestCert(false, "test.example.com", intermediateKey, intermediateCert)
 	if err != nil {
 		t.Fatalf("Не удалось сгенерировать конечный сертификат: %v", err)
 	}
 
-	// Создание цепочки
 	chain := &Chain{
 		Leaf:         leafCert,
 		Intermediate: intermediateCert,
 		Root:         rootCert,
 	}
 
-	// Проверка цепочки
 	if err := chain.Verify(); err != nil {
 		t.Errorf("Проверка цепочки не пройдена: %v", err)
 	}
@@ -125,7 +111,6 @@ func TestChainVerification(t *testing.T) {
 //
 // Ожидает, что проверка цепочки завершится с ошибкой.
 func TestInvalidChain(t *testing.T) {
-	// Генерация двух независимых CA
 	root1Cert, _, err := generateTestCert(true, "Test Root CA 1", nil, nil)
 	if err != nil {
 		t.Fatalf("Не удалось сгенерировать корневой CA 1: %v", err)
@@ -136,22 +121,103 @@ func TestInvalidChain(t *testing.T) {
 		t.Fatalf("Не удалось сгенерировать корневой CA 2: %v", err)
 	}
 
-	// Генерация конечного сертификата, подписанного root2
 	leafCert, _, err := generateTestCert(false, "test.example.com", root2Key, root2Cert)
 	if err != nil {
 		t.Fatalf("Не удалось сгенерировать конечный сертификат: %v", err)
 	}
 
-	// Создание несоответствующей цепочки (конечный сертификат подписан root2,
-	// но корневым указан root1)
 	chain := &Chain{
 		Leaf:         leafCert,
-		Intermediate: root2Cert, // Использование root2 как промежуточного
+		Intermediate: root2Cert,
 		Root:         root1Cert,
 	}
 
-	// Проверка должна завершиться ошибкой
 	if err := chain.Verify(); err == nil {
 		t.Error("Ожидалась ошибка проверки цепочки, но проверка прошла успешно")
+	}
+}
+
+// TestLoadCertificate тестирует загрузку отдельного сертификата
+func TestLoadCertificate(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "chain_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cert, _, err := generateTestCert(true, "Test Cert", nil, nil)
+	if err != nil {
+		t.Fatalf("Failed to generate cert: %v", err)
+	}
+
+	certPath := filepath.Join(tmpDir, "test.crt")
+	if err := saveCertToFile(cert, certPath); err != nil {
+		t.Fatalf("Failed to save cert: %v", err)
+	}
+
+	loadedCert, err := LoadCertificate(certPath)
+	if err != nil {
+		t.Errorf("LoadCertificate failed: %v", err)
+	}
+	if loadedCert == nil {
+		t.Error("Loaded certificate is nil")
+	}
+}
+
+// saveCertToFile сохраняет сертификат в файл
+func saveCertToFile(cert *x509.Certificate, path string) error {
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: cert.Raw,
+	})
+	return os.WriteFile(path, pemBytes, 0644)
+}
+
+// TestLoadChain тестирует загрузку цепочки из файлов
+func TestLoadChain(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "chain_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	rootCert, rootKey, err := generateTestCert(true, "Root CA", nil, nil)
+	if err != nil {
+		t.Fatalf("Failed to generate root cert: %v", err)
+	}
+
+	interCert, _, err := generateTestCert(true, "Intermediate CA", rootKey, rootCert)
+	if err != nil {
+		t.Fatalf("Failed to generate intermediate cert: %v", err)
+	}
+
+	leafCert, _, err := generateTestCert(false, "Leaf Cert", rootKey, rootCert)
+	if err != nil {
+		t.Fatalf("Failed to generate leaf cert: %v", err)
+	}
+
+	rootPath := filepath.Join(tmpDir, "root.crt")
+	interPath := filepath.Join(tmpDir, "inter.crt")
+	leafPath := filepath.Join(tmpDir, "leaf.crt")
+
+	if err := saveCertToFile(rootCert, rootPath); err != nil {
+		t.Fatalf("Failed to save root cert: %v", err)
+	}
+	if err := saveCertToFile(interCert, interPath); err != nil {
+		t.Fatalf("Failed to save inter cert: %v", err)
+	}
+	if err := saveCertToFile(leafCert, leafPath); err != nil {
+		t.Fatalf("Failed to save leaf cert: %v", err)
+	}
+
+	chain, err := LoadChain(leafPath, interPath, rootPath)
+	if err != nil {
+		t.Errorf("LoadChain failed: %v", err)
+	}
+	if chain == nil {
+		t.Error("Loaded chain is nil")
+	}
+	if chain.Leaf == nil || chain.Intermediate == nil || chain.Root == nil {
+		t.Error("Expected all chain components (Leaf, Intermediate, Root) to be non-nil")
 	}
 }

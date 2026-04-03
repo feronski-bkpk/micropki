@@ -1,0 +1,41 @@
+# MicroPKI Demo Configuration
+# Этот файл демонстрирует поддержку YAML конфигурации
+
+pki:
+  root_ca:
+    subject: "CN=MicroPKI Demo Root CA"
+    key_type: rsa
+    key_size: 4096
+    validity_days: 3650
+  
+  intermediate_ca:
+    subject: "CN=MicroPKI Demo Intermediate CA"
+    key_type: rsa
+    key_size: 4096
+    validity_days: 1825
+  
+  policies:
+    min_rsa_size: 2048
+    min_ecc_size: 256
+    max_cert_validity_days: 365
+    block_wildcard_san: true
+    allowed_signature_algorithms:
+      - SHA256-RSA
+      - SHA384-RSA
+      - SHA256-ECDSA
+      - SHA384-ECDSA
+  
+  rate_limiting:
+    enabled: true
+    requests_per_second: 10
+    burst_size: 20
+  
+  audit:
+    enabled: true
+    log_file: "./pki/audit/audit.log"
+    chain_file: "./pki/audit/chain.dat"
+    integrity_check: true
+  
+  transparency:
+    enabled: true
+    log_file: "./pki/audit/ct.log"

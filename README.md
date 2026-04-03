@@ -5,6 +5,7 @@ MicroPKI — это инструмент командной строки для 
 ## Содержание
 
 - [Возможности](#возможности)
+- [Архитектура системы](#архитектура-системы)
 - [Быстрый старт](#быстрый-старт)
 - [Установка](#установка)
 - [Использование](#использование)
@@ -16,12 +17,17 @@ MicroPKI — это инструмент командной строки для 
   - [Команды OCSP](#команды-ocsp)
   - [Команды базы данных](#команды-базы-данных)
   - [Команды репозитория](#команды-репозитория)
+- [Демонстрация](#демонстрация)
+- [TLS Интеграция](#tls-интеграция)
+- [Code Signing](#code-signing)
 - [Политики безопасности](#политики-безопасности)
 - [Система аудита](#система-аудита)
 - [Certificate Transparency (CT)](#certificate-transparency-ct)
 - [Rate Limiting](#rate-limiting)
 - [Компрометация ключей](#компрометация-ключей)
 - [Детекция аномалий](#детекция-аномалий)
+- [Тестирование производительности](#тестирование-производительности)
+- [CI/CD Pipeline](#cicd-pipeline)
 - [Примеры](#примеры)
 - [Структура проекта](#структура-проекта)
 - [API Репозитория](#api-репозитория)
@@ -42,60 +48,99 @@ MicroPKI — это инструмент командной строки для 
 - **Поддержка Subject Alternative Names (SAN)**
 - **Клиентские инструменты** (генерация CSR, запрос сертификатов, валидация)
 - **Полная поддержка CRL версии 2 (v2)** согласно RFC 5280
-- **OCSP-ответчик** согласно RFC 6960
+- **OCSP-ответчик**
 - **SQLite база данных** для хранения сертификатов
 - **HTTP репозиторий** для распространения сертификатов и CRL
+- **Аудит с криптографической целостностью**
+- **Детекция аномалий**
+- **Полная интеграционная демонстрация**
 
-### **Новые функции Спринта 7**
+## Архитектура системы
 
-#### **Аудит с криптографической целостностью**
-- NDJSON формат журнала (`./pki/audit/audit.log`)
-- SHA-256 хеш-цепочка для защиты от подделки
-- Файл `chain.dat` с последним хешем
-- Команды: `audit query`, `audit verify`
+```mermaid
+graph TB
+    subgraph "Клиентская часть"
+        CLI[CLI Tool]
+        CSR[CSR Generator]
+        VALID[Validator]
+        STATUS[Status Checker]
+    end
+    
+    subgraph "Центр Сертификации (CA)"
+        ROOT[Root CA]
+        INTER[Intermediate CA]
+        POLICY[Policy Enforcer]
+        AUDIT[Audit Logger]
+        CT[CT Logger]
+    end
+    
+    subgraph "Хранилище"
+        DB[(SQLite DB)]
+        CERTS[Certs Storage]
+        KEYS[Keys Storage]
+        CRL[CRL Storage]
+        LOGS[Audit Logs]
+    end
+    
+    subgraph "Сервисы"
+        REPO[HTTP Repository]
+        OCSP[OCSP Responder]
+        RATE[Rate Limiter]
+    end
+    
+    subgraph "Внешние системы"
+        CLIENT[External Client]
+        SERVER[TLS Server]
+        CODE[Code Signing]
+    end
+    
+    CLI --> ROOT
+    CLI --> INTER
+    CLI --> REPO
+    
+    ROOT --> POLICY
+    INTER --> POLICY
+    POLICY --> AUDIT
+    POLICY --> CT
+    
+    ROOT --> DB
+    INTER --> DB
+    AUDIT --> LOGS
+    CT --> LOGS
+    
+    REPO --> DB
+    REPO --> RATE
+    REPO --> CERTS
+    REPO --> CRL
+    
+    OCSP --> DB
+    OCSP --> RATE
+    
+    CLIENT --> REPO
+    CLIENT --> OCSP
+    SERVER --> CERTS
+    CODE --> CERTS
+    
+    VALID --> ROOT
+    VALID --> INTER
+    STATUS --> OCSP
+    STATUS --> CRL
+    
+    style ROOT fill:#f9f,stroke:#333,stroke-width:4px
+    style INTER fill:#bbf,stroke:#333,stroke-width:4px
+    style DB fill:#bfb,stroke:#333,stroke-width:2px
+    style AUDIT fill:#ffb,stroke:#333,stroke-width:2px
+```
 
-#### **Принудительное применение политик безопасности**
-- **Размеры ключей**:
-  - RSA: Корневой CA ≥ 4096, Промежуточный ≥ 3072, Конечный ≥ 2048
-  - ECC: Корневой/Промежуточный ≥ P-384, Конечный ≥ P-256
-- **Сроки действия**:
-  - Корневой CA: до 10 лет (3650 дней)
-  - Промежуточный CA: до 5 лет (1825 дней)
-  - Конечные сертификаты: до 1 года (365 дней)
-- **Ограничения SAN**:
-  - Wildcard блокируется по умолчанию
-  - Проверка разрешенных типов для каждого шаблона
-- **Алгоритмы подписи**: SHA-1 и MD5 запрещены
-- **Ограничение длины пути**: промежуточные CA имеют pathLen=0
-
-#### **Rate Limiting**
-- Token bucket алгоритм
-- Конфигурация через флаги `--rate-limit` и `--rate-burst`
-- HTTP статус 429 Too Many Requests
-- Заголовок `Retry-After`
-
-#### **Certificate Transparency (CT) симуляция**
-- Файл `./pki/audit/ct.log`
-- Запись каждого выпущенного сертификата
-- Серийный номер, субъект, отпечаток SHA-256
-
-#### **Компрометация ключей**
-- Команда `ca compromise` для симуляции
-- Таблица `compromised_keys` в БД
-- Экстренное обновление CRL
-- Блокировка выпуска с скомпрометированными ключами
-
-#### **Детекция аномалий**
-- Команда `audit detect-anomalies`
-- Обнаружение всплесков активности (>20 запросов/мин)
-- Выявление большого количества ошибок (>5)
-- Отслеживание компрометаций
-- Анализ процента ошибок (>30%)
-
-#### **Конфигурация через YAML/TOML**
-- Поддержка флага `--config`
-- Настраиваемые политики безопасности
-- Конфигурация rate limiting и аудита
+**Компоненты системы:**
+- **Root CA**: Корневой центр сертификации (самоподписанный)
+- **Intermediate CA**: Промежуточный УЦ (подписан Root CA)
+- **Policy Enforcer**: Применяет политики безопасности (размеры ключей, сроки, SAN)
+- **Audit Logger**: Ведет NDJSON журнал с SHA-256 хеш-цепочкой
+- **CT Logger**: Симулирует Certificate Transparency
+- **HTTP Repository**: Распространяет сертификаты и CRL
+- **OCSP Responder**: Отвечает на запросы статуса сертификатов
+- **Rate Limiter**: Ограничивает количество запросов
 
 ## Быстрый старт
 
@@ -107,8 +152,8 @@ cd micropki
 # 2. Соберите проект
 make build
 
-# 3. Создайте полную PKI иерархию с аудитом
-make example-full
+# 3. Запустите полную демонстрацию
+make demo
 
 # 4. Проверьте целостность аудита
 ./micropki-cli audit verify
@@ -334,6 +379,121 @@ sudo make install  # опционально, установит в /usr/local/bi
   --rate-burst 3
 ```
 
+## Демонстрация
+
+MicroPKI включает полностью автоматизированную демонстрацию.
+
+### Запуск демонстрации
+
+```bash
+# Полная демонстрация всех возможностей
+make demo
+
+# Или напрямую
+./demo.sh ./micropki-cli
+```
+
+### Что демонстрируется
+
+1. **Создание PKI иерархии**:
+   - Корневой CA (RSA 4096)
+   - Промежуточный CA (RSA 4096)
+   
+2. **Выпуск сертификатов**:
+   - Серверный сертификат (TLS)
+   - Клиентский сертификат (аутентификация)
+   - Code signing сертификат
+   - OCSP responder сертификат
+
+3. **Проверка валидации**:
+   - Полная цепочка доверия
+   - Проверка статуса через OCSP
+
+4. **Отзыв сертификата**:
+   - Отзыв с причиной keyCompromise
+   - Генерация обновленного CRL
+   - Проверка отозванного статуса
+
+5. **Аудит и целостность**:
+   - Проверка хеш-цепочки аудита
+   - Демонстрация CT журнала
+
+6. **Code signing**:
+   - Подпись скрипта
+   - Проверка подписи
+   - Демонстрация нарушения целостности
+
+7. **TLS интеграция**:
+   - Запуск HTTPS сервера
+   - Успешное подключение с доверием к Root CA
+
+8. **Детекция аномалий**:
+   - Анализ журнала аудита
+   - Выявление подозрительной активности
+
+## TLS Интеграция
+
+MicroPKI демонстрирует, что сертификаты, выпущенные системой, могут использоваться для защиты реальных TLS соединений.
+
+### Пример TLS сервера
+
+```bash
+# Запуск HTTPS сервера с сертификатом от MicroPKI
+python3 -m http.server 8443 \
+  --certfile ./pki/certs/server.cert.pem \
+  --keyfile ./pki/certs/server.key.pem
+
+# Подключение клиента с доверием к Root CA
+curl --cacert ./pki/certs/ca.cert.pem https://localhost:8443
+```
+
+### Демонстрация отзыва
+
+```bash
+# Отзыв сертификата
+./micropki-cli ca revoke <serial> --reason keyCompromise
+
+# Генерация обновленного CRL
+./micropki-cli ca gen-crl --ca intermediate
+
+# Клиент с проверкой отзыва должен завершиться ошибкой
+curl --cacert ./pki/certs/ca.cert.pem \
+     --crlfile ./pki/crl/intermediate.crl.pem \
+     https://localhost:8443
+# Ожидаемая ошибка: certificate revoked
+```
+
+## Code Signing
+
+MicroPKI поддерживает выпуск сертификатов для подписи кода и демонстрирует их использование.
+
+### Подпись скрипта
+
+```bash
+# Создание тестового скрипта
+echo '#!/bin/bash\necho "Hello from signed script!"' > script.sh
+chmod +x script.sh
+
+# Подпись скрипта
+openssl dgst -sha256 -sign codesign.key.pem -out script.sh.sig script.sh
+
+# Проверка подписи
+openssl dgst -sha256 -verify <(openssl x509 -in codesign.cert.pem -pubkey -noout) \
+  -signature script.sh.sig script.sh
+```
+
+### Демонстрация нарушения целостности
+
+```bash
+# Изменение скрипта
+echo "# Tampered" >> script.sh
+
+# Проверка подписи (должна завершиться ошибкой)
+openssl dgst -sha256 -verify <(openssl x509 -in codesign.cert.pem -pubkey -noout) \
+  -signature script.sh.sig script.sh
+# Ожидаемая ошибка: Verification Failure
+```
+
 ## Политики безопасности
 
 ### Размеры ключей
@@ -471,6 +631,49 @@ Too Many Requests
   - Высокий процент ошибок: 41.0% (16 из 39)
 ```
 
+## Тестирование производительности
+
+MicroPKI включает тесты производительности для проверки масштабируемости системы.
+
+### Тест 1000 сертификатов
+
+```bash
+# Запуск теста производительности
+make perf-test
+
+# Или напрямую
+go test -v -run TestPerformance -timeout 10m ./tests/
+```
+
+**Ожидаемые метрики:**
+- Выпуск 1000 сертификатов: < 100 секунд (≥10 сертификатов/сек)
+- Проверка 1000 сертификатов: < 10 секунд (≥100 проверок/сек)
+
+### Результаты производительности
+
+```
+========================================
+Performance Test Results:
+  Certificates issued: 1000
+  Total time: 45.2s
+  Certificates/second: 22.12
+========================================
+```
+
+## CI/CD Pipeline
+
+MicroPKI использует GitHub Actions для непрерывной интеграции и доставки.
+
+### Что проверяется при каждом push
+
+1. **Сборка проекта**
+2. **Модульные тесты**
+3. **Покрытие кода**
+4. **Интеграционные тесты**
+5. **Демонстрация**
+6. **Тесты производительности**
+7. **Линтинг**
+
 ## Примеры
 
 ### Пример 1: Полный рабочий процесс с аудитом и политиками
@@ -541,77 +744,20 @@ Too Many Requests
 # Ошибка: срок превышает максимальный
 ```
 
-### Пример 3: Rate limiting
+### Пример 3: Демонстрация
 
 ```bash
-# Запуск сервера с ограничением
-./micropki-cli repo serve \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --rate-limit 2 \
-  --rate-burst 3
+# Запуск полной демонстрации
+make demo
 
-# Быстрые запросы
-for i in {1..5}; do
-  curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/health
-done
-# Вывод: 200, 200, 200, 200, 429
-```
-
-### Пример 4: Компрометация и блокировка
-
-```bash
-# Создание сертификата
-./micropki-cli ca issue-cert \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file <(echo -n "intpass") \
-  --template server \
-  --subject "CN=compromise-test.local" \
-  --san "dns:compromise-test.local" \
-  --out-dir ./pki/certs
-
-# Симуляция компрометации
-./micropki-cli ca compromise \
-  --cert ./pki/certs/compromise-test.local.cert.pem \
-  --reason keyCompromise \
-  --force
-
-# Попытка выпуска с тем же ключом (будет заблокирована)
-openssl req -new -key ./pki/certs/compromise-test.local.key.pem \
-  -subj "/CN=blocked.local" \
-  -addext "subjectAltName=DNS:blocked.local" \
-  -out /tmp/blocked.csr.pem
-
-./micropki-cli ca issue-cert \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file <(echo -n "intpass") \
-  --template server \
-  --subject "CN=blocked.local" \
-  --csr /tmp/blocked.csr.pem \
-  --out-dir /tmp
-# Ошибка: ключ скомпрометирован, выпуск запрещен
-```
-
-### Пример 5: Детекция аномалий
-
-```bash
-# Генерация множества ошибок
-for i in {1..15}; do
-  ./micropki-cli ca issue-cert \
-    --ca-cert ./pki/certs/intermediate.cert.pem \
-    --ca-key ./pki/private/intermediate.key.pem \
-    --ca-pass-file <(echo -n "intpass") \
-    --template server \
-    --subject "CN=error-$i.local" \
-    --san "dns:*.error-$i.local" \
-    --out-dir /tmp > /dev/null 2>&1
-done
-
-# Анализ аномалий
-./micropki-cli audit detect-anomalies --window 1
-# Вывод обнаружит: много ошибок, высокий процент ошибок
+# Демонстрация будет:
+# 1. Создавать PKI иерархию
+# 2. Выпускать сертификаты всех типов
+# 3. Запускать репозиторий и OCSP responder
+# 4. Проверять валидацию и отзыв
+# 5. Демонстрировать TLS и code signing
+# 6. Проверять целостность аудита
+# 7. Анализировать аномалии
 ```
 
 ## Структура проекта
@@ -646,6 +792,8 @@ micropki/
 │       └── validation/               # Валидация цепочек
 ├── tests/                            # Интеграционные тесты
 ├── scripts/                          # Вспомогательные скрипты
+├── demo/                             # Демонстрационные файлы
+├── .github/workflows/ci.yml          # CI/CD pipeline
 ├── Makefile                          # Автоматизация сборки
 ├── go.mod                            # Зависимости Go
 └── README.md                         # Этот файл
@@ -677,8 +825,12 @@ pki/
 └── certs/
     ├── ocsp.cert.pem                 # OCSP responder сертификат
     ├── ocsp.key.pem                  # Незашифрованный ключ OCSP (0600)
-    ├── example.com.cert.pem          # Тестовый сертификат
-    ├── example.com.key.pem           # Незашифрованный ключ (0600)
+    ├── server.cert.pem               # Серверный сертификат (TLS)
+    ├── server.key.pem                # Ключ серверного сертификата
+    ├── client.cert.pem               # Клиентский сертификат
+    ├── client.key.pem                # Ключ клиентского сертификата
+    ├── codesign.cert.pem             # Code signing сертификат
+    ├── codesign.key.pem              # Ключ code signing
     └── ...
 ```
 
@@ -734,6 +886,24 @@ pki/
 - Экстренное обновление CRL при компрометации
 - Аудит всех компрометаций
 
+### Security Considerations
+
+**Известные ограничения:**
+1. **Закрытые ключи конечных сущностей** хранятся незашифрованными
+2. **Парольные фразы CA** считываются из файлов
+3. **OCSP responder** использует HTTP (без TLS)
+4. **Rate limiting** базовый, не защищает от распределенных атак
+5. **Аудит** использует хеш-цепочку, но файл не подписан
+6. **CT** только симулирован (нет дерева Меркла)
+7. **Система учебная** - не рекомендуется для production без доработки
+
+**Рекомендации для production:**
+- Использовать HSM для ключей CA
+- Развернуть OCSP за reverse proxy с TLS
+- Интегрироваться с реальными CT логами
+- Подписывать chain.dat отдельным ключом
+- Использовать дополнительные механизмы защиты от DDoS
+
 ## Тестирование
 
 ### Запуск тестов
@@ -745,23 +915,17 @@ make test
 # Тесты Спринта 7
 make test-sprint7
 
-# Полный тест аудита
-make test-audit
+# Тесты Спринта 8 (демонстрация + производительность)
+make test-sprint8
 
-# Тест rate limiting
-make test-rate-limit
+# Тест производительности (1000 сертификатов)
+make perf-test
 
-# Тест CT-журнала
-make test-ct
+# Проверка покрытия кода (требуется ≥80%)
+make check-coverage
 
-# Тест компрометации
-make test-compromise
-
-# Тест детекции аномалий
-make test-detection-anomalies
-
-# Тест RSA-1024
-make test-rsa-1024
+# Полный CI пайплайн
+make ci
 
 # Все тесты
 make test-all
@@ -769,14 +933,19 @@ make test-all
 
 ## Makefile команды
 
-### Основные цели
+### Цели Sprint 8
 
 | Команда | Описание |
 |---------|----------|
 | `make build` | Собрать бинарный файл |
+| `make demo` | Запустить полную демонстрацию Sprint 8 |
+| `make perf-test` | Тест производительности (1000 сертификатов) |
+| `make coverage` | Генерация отчета о покрытии кода |
+| `make check-coverage` | Проверка покрытия (≥80%) |
+| `make ci` | Запуск полного CI пайплайна |
+| `make release` | Создание релизного тега v1.0.0 |
 | `make clean` | Удалить все сгенерированные файлы |
-| `make test` | Запустить модульные тесты |
-| `make test-all` | Все тесты (включая Спринт 7) |
+| `make test-all` | Все тесты (включая Sprint 8) |
 
 ### Цели Спринта 7
 
@@ -785,12 +954,10 @@ make test-all
 | `make test-sprint7` | Полный интеграционный тест Спринта 7 |
 | `make test-audit` | Тест аудита с хеш-цепочкой |
 | `make test-audit-verify` | Проверка целостности аудита |
-| `make test-audit-verify-fake` | Тест обнаружения подделки |
 | `make test-policy` | Тест политик безопасности |
 | `make test-rate-limit` | Тест rate limiting |
 | `make test-ct` | Тест CT-журнала |
 | `make test-compromise` | Тест компрометации ключей |
-| `make test-rsa-1024` | Тест блокировки RSA-1024 |
 | `make test-detection-anomalies` | Тест детекции аномалий |
 
 ### Команды очистки
@@ -800,7 +967,7 @@ make test-all
 | `make clean-pki` | Очистить только PKI файлы |
 | `make clean-logs` | Очистить только логи |
 | `make clean-audit` | Очистить журналы аудита |
-| `make clean-tests` | Очистить тестовые файлы (включая tests/pki) |
+| `make clean-tests` | Очистить тестовые файлы |
 | `make clean-all` | Полная очистка всего |
 
 ## Участие в разработке
@@ -820,3 +987,27 @@ make test-all
 - [Спринт 5](docs/sprints/sprint5.md) - OCSP (Online Certificate Status Protocol)
 - [Спринт 6](docs/sprints/sprint6.md) - Клиентские инструменты и валидация
 - [Спринт 7](docs/sprints/sprint7.md) - Аудит, политики, rate limiting, CT, компрометация
+- [Спринт 8](docs/sprints/sprint8.md) - Интеграция, демонстрация, тестирование производительности
+
+## Благодарности / Ссылки
+
+### Использованные RFC
+- [RFC 5280](https://tools.ietf.org/html/rfc5280) - Internet X.509 Public Key Infrastructure Certificate and Certificate Revocation List (CRL) Profile
+- [RFC 6960](https://tools.ietf.org/html/rfc6960) - Online Certificate Status Protocol (OCSP)
+- [RFC 2986](https://tools.ietf.org/html/rfc2986) - PKCS #10: Certification Request Syntax Specification
+
+### Библиотеки
+- [crypto/x509](https://pkg.go.dev/crypto/x509) - Стандартная библиотека Go для X.509 сертификатов
+- [github.com/mattn/go-sqlite3](https://github.com/mattn/go-sqlite3) - Драйвер SQLite для Go
+
+### Инструменты
+- [OpenSSL](https://www.openssl.org/) - Криптографическая библиотека для подписи кода и проверки TLS
+- [Mermaid](https://mermaid.js.org/) - Инструмент для создания диаграмм в Markdown
+
+## Лицензия
+
+MIT License - см. файл [LICENSE](LICENSE)
+
+**MicroPKI v1.0.0** - Полная PKI система с аудитом, политиками, rate limiting, CT, компрометацией и демонстрацией.
+
+*Для вопросов и предложений: [GitHub Issues](https://github.com/feronski-bkpk/micropki/issues)*
