@@ -24,24 +24,24 @@ jobs:
       run: |
         go mod download
         sudo apt-get update
-        sudo apt-get install -y openssl curl
+        sudo apt-get install -y openssl curl sqlite3
 
     - name: Build
       run: make build
 
     - name: Run unit tests
-      run: go test -v ./...   # убрал -coverprofile
+      run: go test -v ./...
 
     - name: Run integration tests
-      run: make test-all || true   # временно не фейлим пайплайн
+      run: make test-all || true
 
     - name: Run performance tests
       run: go test -v -run TestPerformance -timeout 10m ./tests/ || true
 
     - name: Run demo script
       run: |
-        chmod +x demo.sh
-        ./demo.sh ./micropki-cli || true
+        chmod +x demo/demo.sh
+        ./demo/demo.sh ./micropki-cli || true
 
     - name: Check audit integrity
       run: |
@@ -74,7 +74,7 @@ jobs:
         make build
         mkdir -p dist
         cp micropki-cli dist/
-        cp demo.sh dist/
+        cp demo/demo.sh dist/
         cp README.md dist/
         cp -r docs dist/ || true
 
